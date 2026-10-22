@@ -24,7 +24,10 @@ import segmentation_models_pytorch as smp
 # 加入專案路徑
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from losses.decoupled_exam_loss import DecoupledExamLoss
-from tools.dataset_hybrid import HybridExamDataset, hybrid_collate_fn
+try:
+    from tools.dataset_hybrid import HybridExamDataset, hybrid_collate_fn
+except ModuleNotFoundError:
+    from dataset_hybrid import HybridExamDataset, hybrid_collate_fn
 
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -58,3 +58,9 @@ uv run python remover.py -i output_images/ -o output/
 | `--dpi` | `150` | PDF 逐頁渲染解析度 DPI（建議 150 ~ 200） |
 | `--save-mask` | `False` | 是否儲存手寫筆跡的二值遮罩 (PNG) |
 | `--device` | 自動偵測 | 推論運算裝置 (`cuda` 或 `cpu`) |
+
+---
+
+## 訓練管線與技術文件
+
+- **[三軌解耦考卷去手寫自動化訓練管線架構說明](docs/TRI_TRACK_DECOUPLED_PIPELINE.md)**：詳細解析 70 組大字跨距包覆難例合成、5px 解耦安全緩衝損失（`DecoupledExamLoss`）、雙資產包一體化架構與 1,500 Steps 全自動 Colab 雲端訓練 SOP。
