@@ -31,7 +31,7 @@ class HybridExamDataset(Dataset):
         dpi=150,
         is_train=True,
         real_ratio=0.20,
-        pseudo_ratio=0.20
+        pseudo_ratio=0.08
     ):
         self.total_steps = total_steps
         self.is_train = is_train

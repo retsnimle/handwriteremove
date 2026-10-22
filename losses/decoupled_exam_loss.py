@@ -43,14 +43,15 @@ class DecoupledExamLoss(nn.Module):
 
         with torch.no_grad():
             # 1. 形態學安全緩衝區：從受保護印刷遮罩中，扣除手寫筆劃及其 5x5 鄰域
-            hw_dilated_5 = self._gpu_dilate(hw_gt, self.buffer_k)
-            strict_text_mask = text_gt * (1.0 - hw_dilated_5)
+            hw_dilated_buffer = self._gpu_dilate(hw_gt, self.buffer_k)
+            strict_text_mask = text_gt * (1.0 - hw_dilated_buffer)
 
-            # 2. 跨字手寫強迫召回區：找出位於印刷字 15x15 鄰域內的高難度手寫像素
-            text_dilated_15 = self._gpu_dilate(text_gt, self.prox_k)
-            hard_hw_mask = hw_gt * text_dilated_15
+            # 2. 跨字手寫強迫召回區：僅約束在與印刷字真實接觸/交界 5px 內的手寫像素
+            # 避免激勵權重洩漏到純白紙背景上的手寫筆劃
+            text_dilated_contact = self._gpu_dilate(text_gt, 5)
+            hard_hw_mask = hw_gt * text_dilated_contact
 
-            # 3. 構建空間自適應像素權重 (對跨字手寫給予 1 + 4.0 = 5.0 倍的正樣本權重)
+            # 3. 構建空間自適應像素權重 (對真實交界處手寫給予 1 + 4.0 = 5.0 倍的正樣本權重)
             pixel_weights = 1.0 + self.overlap_recall_boost * hard_hw_mask
 
         # --- A. 空間加權 BCE Loss ---
@@ -63,8 +64,9 @@ class DecoupledExamLoss(nn.Module):
         union = probs.sum(dim=(2, 3)) + hw_gt.sum(dim=(2, 3))
         loss_dice = (1.0 - (2.0 * intersection + smooth) / (union + smooth)).mean()
 
-        # --- C. 解耦後的 Text_FP_Penalty (僅在安全緩衝區外的純印刷字上生效) ---
-        fp_on_strict_text = (probs * strict_text_mask).sum(dim=(2, 3)) / (strict_text_mask.sum(dim=(2, 3)) + 1.0)
+        # --- C. 解耦後的 Text_FP_Penalty (數值穩定分母 clamp >= 1.0) ---
+        denom = strict_text_mask.sum(dim=(2, 3)).clamp(min=1.0)
+        fp_on_strict_text = (probs * strict_text_mask).sum(dim=(2, 3)) / denom
         loss_text_fp = fp_on_strict_text.mean()
 
         total_loss = (

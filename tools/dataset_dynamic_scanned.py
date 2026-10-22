@@ -148,9 +148,8 @@ class FullDynamicScannedDataset(Dataset):
         out_roi = roi_bgr * (1.0 - roi_alpha_3c) + blended_roi * roi_alpha_3c
         canvas_bgr[y1:y2, x1:x2] = np.clip(out_roi, 0, 255).astype(np.uint8)
 
-        # 更新手寫 GT (排除最核心極黑骨架，避免切斷題號核心)
-        roi_text_core = pure_text_mask[y1:y2, x1:x2] > 0
-        valid_hw = (roi_alpha > 0.18) & (~roi_text_core)
+        # 更新手寫 GT：忠實標記墨水存在 (Ink Presence)，絕不在印刷黑芯處人為挖洞
+        valid_hw = (roi_alpha > 0.18)
         hw_mask_full[y1:y2, x1:x2][valid_hw] = 255
 
     def synthesize_enclosing_giant_stroke(self, canvas_bgr, hw_mask_full, pure_text_mask, anchor_box, letter_stamp_rgba=None):
@@ -216,25 +215,15 @@ class FullDynamicScannedDataset(Dataset):
             self.blend_ink_over_print(canvas_bgr, hw_mask_full, pure_text_mask, loop_alpha, ink_bgr, sx1, sy1)
 
     def multi_scale_random_crop(self, img, hw_mask, text_mask, target_size=768):
+        """保持原生 150 DPI 物理尺度，固定裁切 768x768，杜絕線寬變形失真"""
         H, W = img.shape[:2]
-        if random.random() < 0.50:
-            crop_sz = target_size
-        else:
-            crop_sz = random.choice([1024, 1280, 1536])
-            crop_sz = min(crop_sz, H, W)
-
+        crop_sz = target_size
         y1 = random.randint(0, max(0, H - crop_sz))
         x1 = random.randint(0, max(0, W - crop_sz))
 
         img_c = img[y1:y1 + crop_sz, x1:x1 + crop_sz]
         hw_c = hw_mask[y1:y1 + crop_sz, x1:x1 + crop_sz]
         txt_c = text_mask[y1:y1 + crop_sz, x1:x1 + crop_sz]
-
-        if crop_sz != target_size:
-            img_c = cv2.resize(img_c, (target_size, target_size), interpolation=cv2.INTER_AREA)
-            hw_c = cv2.resize(hw_c, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
-            txt_c = cv2.resize(txt_c, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
-
         return img_c, hw_c, txt_c
 
     def __getitem__(self, idx):

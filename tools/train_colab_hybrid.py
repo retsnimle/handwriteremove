@@ -127,6 +127,8 @@ def train(args):
                 loss, bce_val, dice_val, text_fp_val = criterion(logits, masks, pure_texts)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -181,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--catalog_path", default="assets/scanned_catalog.json")
     parser.add_argument("--pseudo_root", default="output/pseudo_hard_dataset")
     parser.add_argument("--real_ratio", type=float, default=0.20, help="真實 ExamInk 採樣比例")
-    parser.add_argument("--pseudo_ratio", type=float, default=0.20, help="飛輪偽標籤採樣比例")
+    parser.add_argument("--pseudo_ratio", type=float, default=0.08, help="飛輪偽標籤採樣比例 (防過擬合設為 0.08)")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
