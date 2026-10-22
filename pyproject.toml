@@ -1,0 +1,29 @@
+[project]
+name = "handwriteremove"
+version = "0.1.0"
+description = "Remove handwritten notes from exams/documents using DIS (IS-Net)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "numpy>=2.0,<2.3",
+    "pillow>=9.0.0",
+    "pymupdf>=1.22.0",
+    "opencv-python>=4.8.0",
+    "scikit-image>=0.22.0",
+    "tqdm>=4.66.0",
+    "huggingface-hub>=0.20.0",
+    "rapidocr-onnxruntime>=1.4.4",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

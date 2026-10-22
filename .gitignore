@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Zip bundles & Chunks
+*.zip
+chunks_upload/
+clean_pdfs(unuse)/
+
+# Model Weights (Over GitHub 100MB limit)
+weights/*.pth
+weights/*.pt
+weights/*.bin
+weights/.cache/
+
+# Outputs & Debug
+output/
+output_cleaned/
+debug_*.png
+debug_*.pdf
+*.log
+.aider*
