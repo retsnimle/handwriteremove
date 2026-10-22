@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 雙端全動態真實掃描考卷資料集 (Full Dynamic Dual-Augmentation Dataset On-The-Fly)
-更新版：全面提高【手寫 A B C D E】在題號與作答框中的覆蓋比例！
-- 載入 311 個真實學生手寫 A B C D E 字母庫 (hw_letter_marks.json，涵蓋藍筆、黑筆、鉛筆)
-- 錨點蓋印時，以 85%~90% 高概率優先在作答框與題號旁蓋上「手寫 A B C D E」
-- 配合 3.0x 文字誤殺重罰損失 (Text-Aware Loss)
-- 20% 硬性負樣本 (Hard Negative Mining)
+第二階段升級版：
+1. 引入「跨距騎乘與包覆合成 (synthesize_enclosing_giant_stroke)」：
+   - 模式 A (70%): 真實手寫字母印章放大 1.8~3.5 倍 (140~320px)，直接騎乘包覆題號與括號
+   - 模式 B (30%): 具筆壓調變的貝茲曲線大圈選 (Pressure-Modulated Bézier Loop)，帶收筆尖角
+2. 油墨物理疊印 (blend_ink_over_print): Multiply 色彩增值 + 墨色微噪聲 + 排除核心印刷骨架
+3. 動態多尺度視野裁切 (Multi-Scale FoV Crop): 50% 採 1024~1536 大視野縮放，擴展感受野
 """
 
 import os
@@ -50,6 +51,11 @@ class FullDynamicScannedDataset(Dataset):
                 doc.close()
 
         # 2. 載入題號與作答框錨點索引
+        if not os.path.exists(anchors_path):
+            fallback_anchors = os.path.join(assets_root, "exam_anchors_catalog.json")
+            if os.path.exists(fallback_anchors):
+                anchors_path = fallback_anchors
+
         if os.path.exists(anchors_path):
             with open(anchors_path, "r", encoding="utf-8") as f:
                 anchors_data = json.load(f)
@@ -60,11 +66,11 @@ class FullDynamicScannedDataset(Dataset):
             self.anchors_map = {}
             print("[FullDynamicDataset] ⚠️ 未找到 exam_anchors_catalog.json，退回全隨機散佈模式。")
 
-        # 3. 載入分類手寫素材：區分「手寫 A B C D E 字母」與「一般記號/草稿」
+        # 3. 載入手寫印章與記號庫
         self.marks_dir = os.path.join(assets_root, "hw_marks")
         letter_marks_path = os.path.join(assets_root, "hw_letter_marks.json")
         symbol_marks_path = os.path.join(assets_root, "hw_symbol_marks.json")
-        
+
         if os.path.exists(letter_marks_path) and os.path.exists(symbol_marks_path):
             with open(letter_marks_path, "r", encoding="utf-8") as f:
                 self.letter_marks = json.load(f)
@@ -82,8 +88,9 @@ class FullDynamicScannedDataset(Dataset):
             self.letter_marks = self.all_marks
             self.symbol_marks = self.all_marks
 
+        # 4. 載入全頁草稿層
         self.layer_paths = sorted(glob.glob(os.path.join(assets_root, "hw_layers", "*.png")))
-        print(f"[FullDynamicDataset] 載入 {len(self.catalog)} 頁掃描底稿，{len(self.layer_paths)} 頁草稿層。")
+        print(f"[FullDynamicDataset] 載入在地掃描底稿: {len(self.catalog)} 頁, 草稿層: {len(self.layer_paths)} 頁")
 
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -91,329 +98,226 @@ class FullDynamicScannedDataset(Dataset):
     def __len__(self):
         return self.total_steps
 
-    def get_scanned_page(self, pdf_name, page_num):
-        key = (pdf_name, page_num)
+    def get_page_image(self, pdf_rel_path, page_num):
+        key = (pdf_rel_path, page_num)
         if key in self.page_cache:
             return self.page_cache[key].copy()
-
-        full_pdf_path = os.path.join(self.scanned_root, pdf_name)
+        
+        full_pdf_path = os.path.join(self.scanned_root, pdf_rel_path)
         doc = fitz.open(full_pdf_path)
         page = doc[page_num]
         pix = page.get_pixmap(dpi=self.dpi)
-        img_bytes = pix.tobytes("png")
+        img_np = np.frombuffer(pix.tobytes("png"), dtype=np.uint8)
+        bgr = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
         doc.close()
-
-        bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-        if len(self.page_cache) < 80:
+        
+        if len(self.page_cache) < 40:
             self.page_cache[key] = bgr.copy()
         return bgr
 
     def apply_background_dynamic_jitter(self, bg_bgr):
         h, w = bg_bgr.shape[:2]
-        angle = random.uniform(-1.5, 1.5)
+        angle = random.uniform(-1.0, 1.0)
         scale = random.uniform(0.98, 1.02)
-        tx = random.uniform(-8, 8)
-        ty = random.uniform(-8, 8)
-
+        tx = random.uniform(-6, 6)
+        ty = random.uniform(-6, 6)
         M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, scale)
         M[0, 2] += tx
         M[1, 2] += ty
-        bg_jittered = cv2.warpAffine(bg_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+        res_bg = cv2.warpAffine(bg_bgr, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        return res_bg
 
-        r = random.random()
-        if r < 0.35:
-            sigma = random.uniform(0.3, 0.7)
-            bg_jittered = cv2.GaussianBlur(bg_jittered, (0, 0), sigma)
-        elif r < 0.65:
-            k = random.uniform(0.2, 0.5)
-            blurred = cv2.GaussianBlur(bg_jittered, (0, 0), 1.0)
-            bg_jittered = np.clip((1.0 + k) * bg_jittered.astype(np.float32) - k * blurred.astype(np.float32), 0, 255).astype(np.uint8)
-
-        if random.random() < 0.5:
-            alpha = random.uniform(0.95, 1.05)
-            beta = random.uniform(-5, 5)
-            bg_jittered = np.clip(bg_jittered.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
-
-        return bg_jittered
-
-    def apply_stamp_dynamic_jitter(self, stamp_rgba):
-        sh, sw = stamp_rgba.shape[:2]
-        if sh < 6 or sw < 6:
-            return stamp_rgba
-
-        res_rgba = stamp_rgba.copy()
-        r_morph = random.random()
-        k_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        
-        if r_morph < 0.35:
-            res_rgba[:, :, 3] = cv2.dilate(res_rgba[:, :, 3], k_morph, iterations=1)
-        elif r_morph < 0.60:
-            eroded = cv2.erode(res_rgba[:, :, 3], k_morph, iterations=1)
-            if np.sum(eroded > 0) > 10:
-                res_rgba[:, :, 3] = eroded
-
-        if random.random() < 0.50:
-            shear_x = random.uniform(-0.08, 0.08)
-            M_shear = np.float32([[1, shear_x, 0], [0, 1, 0]])
-            nw = int(sw + abs(shear_x) * sh)
-            res_rgba = cv2.warpAffine(res_rgba, M_shear, (nw, sh), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255, 0))
-
-        alpha_scale = random.uniform(0.75, 1.0)
-        res_rgba[:, :, 3] = np.clip(res_rgba[:, :, 3].astype(np.float32) * alpha_scale, 0, 255).astype(np.uint8)
-
-        if random.random() < 0.40:
-            bgr = res_rgba[:, :, :3]
-            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:, :, 0] = (hsv[:, :, 0] + random.uniform(-5, 5)) % 180
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.85, 1.15), 0, 255)
-            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * random.uniform(0.90, 1.10), 0, 255)
-            res_rgba[:, :, :3] = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-        return res_rgba
-
-    def overlay_stamp(self, bg_bgr, bg_mask, stamp_rgba, x, y, scale=1.0, angle=0.0):
-        if self.is_train:
-            stamp_rgba = self.apply_stamp_dynamic_jitter(stamp_rgba)
-
-        sh, sw = stamp_rgba.shape[:2]
-        nw = max(6, int(sw * scale))
-        nh = max(6, int(sh * scale))
-        resized = cv2.resize(stamp_rgba, (nw, nh), interpolation=cv2.INTER_LINEAR)
-
-        if abs(angle) > 1.0:
-            M = cv2.getRotationMatrix2D((nw / 2.0, nh / 2.0), angle, 1.0)
-            cos = np.abs(M[0, 0])
-            sin = np.abs(M[0, 1])
-            bw = int((nh * sin) + (nw * cos))
-            bh = int((nh * cos) + (nw * sin))
-            M[0, 2] += (bw / 2.0) - nw / 2.0
-            M[1, 2] += (bh / 2.0) - nh / 2.0
-            resized = cv2.warpAffine(resized, M, (bw, bh), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255, 0))
-            nw, nh = bw, bh
-
-        H, W = bg_bgr.shape[:2]
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(W, x + nw), min(H, y + nh)
+    def blend_ink_over_print(self, canvas_bgr, hw_mask_full, pure_text_mask, stamp_alpha, ink_color_bgr, x1, y1):
+        """真實原子筆油墨疊印在印刷字上的物理混合"""
+        H, W = canvas_bgr.shape[:2]
+        sh, sw = stamp_alpha.shape[:2]
+        x2, y2 = min(W, x1 + sw), min(H, y1 + sh)
         if x2 <= x1 or y2 <= y1:
             return
 
-        sx1, sy1 = x1 - x, y1 - y
-        sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
+        roi_bgr = canvas_bgr[y1:y2, x1:x2].astype(np.float32)
+        roi_alpha = stamp_alpha[:(y2 - y1), :(x2 - x1)].astype(np.float32)
+        roi_alpha_3c = roi_alpha[..., None]
 
-        sub_stamp = resized[sy1:sy2, sx1:sx2]
-        alpha = (sub_stamp[:, :, 3].astype(float) / 255.0)[:, :, None]
-        ink_bgr = sub_stamp[:, :, :3].astype(float)
+        noise = np.random.normal(0, 3.5, roi_bgr.shape).astype(np.float32)
+        ink_layer = np.clip(np.array(ink_color_bgr, dtype=np.float32) + noise, 0, 255)
 
-        bg_roi = bg_bgr[y1:y2, x1:x2].astype(float)
-        blended = (bg_roi * ink_bgr) / 255.0
+        multiply_bgr = (roi_bgr * ink_layer) / 255.0
+        blended_roi = np.where(roi_bgr < 180, multiply_bgr, ink_layer)
 
-        bg_bgr[y1:y2, x1:x2] = np.clip(alpha * blended + (1.0 - alpha) * bg_roi, 0, 255).astype(np.uint8)
-        patch_mask = (sub_stamp[:, :, 3] > 18).astype(np.uint8) * 255
-        bg_mask[y1:y2, x1:x2] = np.maximum(bg_mask[y1:y2, x1:x2], patch_mask)
+        out_roi = roi_bgr * (1.0 - roi_alpha_3c) + blended_roi * roi_alpha_3c
+        canvas_bgr[y1:y2, x1:x2] = np.clip(out_roi, 0, 255).astype(np.uint8)
+
+        # 更新手寫 GT (排除最核心極黑骨架，避免切斷題號核心)
+        roi_text_core = pure_text_mask[y1:y2, x1:x2] > 0
+        valid_hw = (roi_alpha > 0.18) & (~roi_text_core)
+        hw_mask_full[y1:y2, x1:x2][valid_hw] = 255
+
+    def synthesize_enclosing_giant_stroke(self, canvas_bgr, hw_mask_full, pure_text_mask, anchor_box, letter_stamp_rgba=None):
+        """
+        模式 A (70%): 將手寫字母放大 1.8~3.5 倍 (140~320px)，直接騎乘包覆題號與括號
+        模式 B (30%): 具筆壓調變的貝茲曲線大圈選
+        """
+        qx1, qy1, qx2, qy2 = anchor_box
+        uw, uh = max(24, qx2 - qx1), max(24, qy2 - qy1)
+        cx, cy = (qx1 + qx2) // 2, (qy1 + qy2) // 2
+
+        ink_palette = [
+            (random.randint(18, 45), random.randint(18, 45), random.randint(18, 45)),     # 黑筆
+            (random.randint(95, 155), random.randint(25, 65), random.randint(18, 45)),    # 深藍筆
+            (random.randint(70, 125), random.randint(70, 125), random.randint(70, 125)),  # 鉛筆
+        ]
+        ink_bgr = random.choice(ink_palette)
+
+        if letter_stamp_rgba is not None and random.random() < 0.70:
+            target_h = int(uh * random.uniform(1.8, 3.5))
+            target_h = np.clip(target_h, 140, 320)
+            target_w = int(target_h * random.uniform(0.65, 1.05))
+
+            stamp_resized = cv2.resize(letter_stamp_rgba, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            stamp_alpha = stamp_resized[..., 3].astype(np.float32) / 255.0
+
+            dx = int(random.uniform(-0.15, 0.15) * target_w)
+            dy = int(random.uniform(-0.12, 0.12) * target_h)
+            sx1 = max(0, cx + dx - target_w // 2)
+            sy1 = max(0, cy + dy - target_h // 2)
+
+            self.blend_ink_over_print(canvas_bgr, hw_mask_full, pure_text_mask, stamp_alpha, ink_bgr, sx1, sy1)
+        else:
+            pad_w = int(uw * random.uniform(1.3, 2.2))
+            pad_h = int(uh * random.uniform(1.6, 3.0))
+            patch_w, patch_h = pad_w * 2, pad_h * 2
+            loop_alpha = np.zeros((patch_h, patch_w), dtype=np.float32)
+
+            num_pts = 120
+            total_angle = random.uniform(2.1 * np.pi, 2.6 * np.pi)
+            start_angle = random.uniform(0, 2 * np.pi)
+            base_thickness = random.uniform(2.5, 5.0)
+
+            pts = []
+            for i in range(num_pts):
+                t = i / (num_pts - 1)
+                theta = start_angle + t * total_angle
+                rx = pad_w * (0.65 + 0.12 * np.sin(2 * theta) + 0.08 * t)
+                ry = pad_h * (0.65 + 0.12 * np.cos(3 * theta) - 0.05 * t)
+                px = int(patch_w // 2 + rx * np.cos(theta))
+                py = int(patch_h // 2 + ry * np.sin(theta))
+                pts.append((px, py, t))
+
+            for i in range(len(pts) - 1):
+                x_a, y_a, t_a = pts[i]
+                x_b, y_b, _ = pts[i + 1]
+                w_t = max(1, int(round(base_thickness * (0.8 + 0.45 * np.sin(np.pi * t_a)))))
+                cv2.line(loop_alpha, (x_a, y_a), (x_b, y_b), 1.0, thickness=w_t, lineType=cv2.LINE_AA)
+
+            loop_alpha = cv2.GaussianBlur(loop_alpha, (3, 3), 0.6)
+            sx1 = max(0, cx - patch_w // 2)
+            sy1 = max(0, cy - patch_h // 2)
+            self.blend_ink_over_print(canvas_bgr, hw_mask_full, pure_text_mask, loop_alpha, ink_bgr, sx1, sy1)
+
+    def multi_scale_random_crop(self, img, hw_mask, text_mask, target_size=768):
+        H, W = img.shape[:2]
+        if random.random() < 0.50:
+            crop_sz = target_size
+        else:
+            crop_sz = random.choice([1024, 1280, 1536])
+            crop_sz = min(crop_sz, H, W)
+
+        y1 = random.randint(0, max(0, H - crop_sz))
+        x1 = random.randint(0, max(0, W - crop_sz))
+
+        img_c = img[y1:y1 + crop_sz, x1:x1 + crop_sz]
+        hw_c = hw_mask[y1:y1 + crop_sz, x1:x1 + crop_sz]
+        txt_c = text_mask[y1:y1 + crop_sz, x1:x1 + crop_sz]
+
+        if crop_sz != target_size:
+            img_c = cv2.resize(img_c, (target_size, target_size), interpolation=cv2.INTER_AREA)
+            hw_c = cv2.resize(hw_c, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+            txt_c = cv2.resize(txt_c, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+
+        return img_c, hw_c, txt_c
 
     def __getitem__(self, idx):
         item = random.choice(self.catalog)
-        raw_bgr = self.get_scanned_page(item["pdf"], item["page"])
-
-        if self.is_train:
-            bg_bgr = self.apply_background_dynamic_jitter(raw_bgr)
-        else:
-            bg_bgr = raw_bgr.copy()
-
+        bg_bgr = self.get_page_image(item["pdf"], item["page"])
+        bg_bgr = self.apply_background_dynamic_jitter(bg_bgr)
         H, W = bg_bgr.shape[:2]
+
         synth_img = bg_bgr.copy()
         synth_mask = np.zeros((H, W), dtype=np.uint8)
 
-        gray_bg = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
-        text_core_mask = (gray_bg < 85).astype(np.uint8)
+        gray = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
+        text_core_mask = (gray < 85).astype(np.uint8) * 255
 
-        is_hard_negative = self.is_train and (random.random() < 0.20)
+        anchors = self.anchors_map.get((item["pdf"], item["page"]), [])
+        qnums = [a for a in anchors if a.get("type") == "qnum"]
+        brackets = [a for a in anchors if a.get("type") == "bracket"]
 
-        if not is_hard_negative:
-            # 1. 貼上 2 ~ 4 個真實草稿層 (附帶動態微擾動)
-            if self.layer_paths:
-                for _ in range(random.randint(2, 4)):
-                    l_path = random.choice(self.layer_paths)
-                    layer = cv2.imread(l_path, cv2.IMREAD_UNCHANGED)
-                    if layer is None: continue
-                    lh, lw = layer.shape[:2]
-                    cw = random.randint(min(260, lw), min(750, lw))
-                    ch = random.randint(min(200, lh), min(600, lh))
-                    cx = random.randint(0, lw - cw)
-                    cy = random.randint(0, lh - ch)
-                    crop = layer[cy:cy+ch, cx:cx+cw]
-                    if np.sum(crop[:, :, 3] > 0) > 200:
-                        px = random.randint(10, max(11, W - cw - 10))
-                        py = random.randint(20, max(21, H - ch - 20))
-                        self.overlay_stamp(synth_img, synth_mask, crop, px, py,
-                                           scale=random.uniform(0.85, 1.15),
-                                           angle=random.uniform(-8, 8))
-
-            # 2. ★ 靶向錨點蓋印：高概率覆蓋作答框與題號！
-            page_anchors = self.anchors_map.get((item["pdf"], item["page"]), [])
-            if page_anchors:
-                brackets = [a for a in page_anchors if a["type"] == "bracket"]
-                qnums = [a for a in page_anchors if a["type"] == "qnum"]
+        # 隨機抽取 3~6 個題號進行靶向合成
+        if qnums:
+            sampled_q = random.sample(qnums, min(len(qnums), random.randint(3, 6)))
+            for q in sampled_q:
+                # 尋找同一行相鄰的作答括號
+                qx1, qy1, qx2, qy2 = q["bbox"]
+                adj_bracket = None
+                for b in brackets:
+                    bx1, by1, bx2, by2 = b["bbox"]
+                    if abs(by1 - qy1) < 25 and 0 < (bx1 - qx1) < 140:
+                        adj_bracket = b
+                        break
                 
-                # 對於作答括號：真實學生幾乎每題都會作答！抽取 85% ~ 100% 的括號！
-                if brackets:
-                    # ★ 學生真實考場行為：作答率 100%，所有作答框皆確實作答！
-                    sampled_brackets = list(brackets)
+                # 計算聯合外接框
+                if adj_bracket:
+                    bx1, by1, bx2, by2 = adj_bracket["bbox"]
+                    union_box = (min(qx1, bx1), min(qy1, by1), max(qx2, bx2), max(qy2, by2))
                 else:
-                    sampled_brackets = []
-                
-                # 對於純題號：若有括號，偶爾圈選/筆記題號 (1~4 個)；若無括號 (純題號考卷)，抽 60%~85% 做答案
-                if qnums:
-                    if brackets:
-                        q_count = min(len(qnums), random.randint(1, 4))
-                    else:
-                        q_count = min(len(qnums), max(4, int(len(qnums) * random.uniform(0.60, 0.85))))
-                    sampled_qnums = random.sample(qnums, q_count)
+                    union_box = (qx1, qy1, qx2 + 45, qy2)
+
+                # 35% 機率啟動「跨距騎乘與包覆合成」
+                if random.random() < 0.35:
+                    stamp_rgba = None
+                    if self.letter_marks:
+                        m = random.choice(self.letter_marks)
+                        stamp_rgba = cv2.imread(os.path.join(self.marks_dir, m["file"]), cv2.IMREAD_UNCHANGED)
+                    self.synthesize_enclosing_giant_stroke(synth_img, synth_mask, text_core_mask, union_box, stamp_rgba)
                 else:
-                    sampled_qnums = []
-
-                # --- 蓋印作答括號 ---
-                for anc in sampled_brackets:
-                    # 90% 概率蓋上真實手寫 A B C D E 字母
-                    use_letter = (len(self.letter_marks) > 0) and (random.random() < 0.90)
-                    if use_letter:
-                        m = random.choice(self.letter_marks)
-                    else:
-                        m = random.choice(self.symbol_marks) if self.symbol_marks else random.choice(self.all_marks)
-
-                    stamp = cv2.imread(os.path.join(self.marks_dir, m["file"]), cv2.IMREAD_UNCHANGED)
-                    if stamp is None: continue
-                    sh, sw = stamp.shape[:2]
-
-                    # 括號蓋印：70% 正常尺度，30% 豪邁大字 (scale 1.20 ~ 1.70) 自然溢出覆蓋括號
-                    if random.random() < 0.30:
-                        scale = random.uniform(1.20, 1.70)
-                    else:
-                        scale = random.uniform(0.85, 1.15)
-                    nw = int(sw * scale)
-                    nh = int(sh * scale)
-
-                    # 以括號中心為基準落筆
-                    ix1, iy1, ix2, iy2 = anc["inner_bbox"]
-                    cx = (ix1 + ix2) // 2
-                    cy = (iy1 + iy2) // 2
-                    rx = cx - nw // 2 + random.randint(-6, 6)
-                    ry = cy - nh // 2 + random.randint(-6, 6)
-
-                    self.overlay_stamp(synth_img, synth_mask, stamp, rx, ry,
-                                       scale=scale, angle=random.uniform(-10, 10))
-
-                # --- 蓋印題號 ---
-                for anc in sampled_qnums:
-                    # 題號落筆：若是字母答案，提供多種真實學生行為分佈
-                    use_letter = (len(self.letter_marks) > 0) and (random.random() < (0.85 if not brackets else 0.50))
-                    if use_letter:
-                        m = random.choice(self.letter_marks)
-                    else:
-                        m = random.choice(self.symbol_marks) if self.symbol_marks else random.choice(self.all_marks)
-
-                    stamp = cv2.imread(os.path.join(self.marks_dir, m["file"]), cv2.IMREAD_UNCHANGED)
-                    if stamp is None: continue
-                    sh, sw = stamp.shape[:2]
-
-                    qx1, qy1, qx2, qy2 = anc["bbox"]
-                    qw, qh = max(10, qx2 - qx1), max(10, qy2 - qy1)
-
-                    if use_letter:
-                        mode = random.random()
-                        if mode < 0.40:
-                            # 模式 A: 答案寫在題號左側空白 (正常尺寸)
-                            scale = random.uniform(0.85, 1.15)
+                    # 原有正常作答與批改
+                    if self.all_marks:
+                        m = random.choice(self.all_marks)
+                        stamp = cv2.imread(os.path.join(self.marks_dir, m["file"]), cv2.IMREAD_UNCHANGED)
+                        if stamp is not None:
+                            sh, sw = stamp.shape[:2]
+                            scale = random.uniform(0.9, 1.25)
                             nw, nh = int(sw * scale), int(sh * scale)
                             rx = qx1 - nw - random.randint(4, 15)
-                            ry = qy1 + (qh - nh) // 2 + random.randint(-4, 4)
-                        elif mode < 0.80:
-                            # 模式 B: 豪邁大字直接跨越覆蓋在題號與作答區之上 (scale 1.25 ~ 1.85)
-                            scale = random.uniform(1.25, 1.85)
-                            nw, nh = int(sw * scale), int(sh * scale)
-                            rx = qx1 + (qw - nw) // 2 + random.randint(-10, 20)
-                            ry = qy1 + (qh - nh) // 2 + random.randint(-15, 15)
-                        else:
-                            # 模式 C: 正常尺寸手寫字母直接覆蓋在題號上
-                            scale = random.uniform(0.90, 1.20)
-                            nw, nh = int(sw * scale), int(sh * scale)
-                            rx = qx1 + (qw - nw) // 2 + random.randint(-4, 4)
-                            ry = qy1 + (qh - nh) // 2 + random.randint(-4, 4)
-                    else:
-                        # 覆蓋/圈記在題號上 (可稍微偏大)
-                        scale = random.uniform(0.90, 1.35)
-                        nw, nh = int(sw * scale), int(sh * scale)
-                        rx = qx1 + (qw - nw) // 2 + random.randint(-4, 4)
-                        ry = qy1 + (qh - nh) // 2 + random.randint(-4, 4)
+                            ry = qy1 + (qy2 - qy1 - nh) // 2
+                            alpha = stamp[..., 3].astype(np.float32) / 255.0
+                            stamp_res = cv2.resize(alpha, (nw, nh))
+                            self.blend_ink_over_print(synth_img, synth_mask, text_core_mask, stamp_res, (30, 30, 30), rx, ry)
 
-                    self.overlay_stamp(synth_img, synth_mask, stamp, rx, ry,
-                                       scale=scale, angle=random.uniform(-12, 12))
+        # 散落草稿筆跡
+        if self.layer_paths and random.random() < 0.35:
+            lp = random.choice(self.layer_paths)
+            layer = cv2.imread(lp, cv2.IMREAD_UNCHANGED)
+            if layer is not None:
+                lh, lw = layer.shape[:2]
+                ly = random.randint(0, max(0, H - lh))
+                lx = random.randint(0, max(0, W - lw))
+                l_alpha = (layer[..., 3].astype(np.float32) / 255.0) * random.uniform(0.4, 0.8)
+                self.blend_ink_over_print(synth_img, synth_mask, text_core_mask, l_alpha, (40, 40, 40), lx, ly)
 
-            # 3. 散落印章 (其餘 2 ~ 4 個印章隨機散佈全頁)
-            if self.all_marks:
-                for _ in range(random.randint(2, 4)):
-                    m = random.choice(self.all_marks)
-                    stamp = cv2.imread(os.path.join(self.marks_dir, m["file"]), cv2.IMREAD_UNCHANGED)
-                    if stamp is None: continue
-                    sh, sw = stamp.shape[:2]
-                    rx = random.randint(10, max(11, W - sw - 10))
-                    ry = random.randint(15, max(16, H - sh - 15))
-                    self.overlay_stamp(synth_img, synth_mask, stamp, rx, ry,
-                                       scale=random.uniform(0.80, 1.25),
-                                       angle=random.uniform(-12, 12))
+        # 多尺度動態視野裁切
+        crop_img, crop_hw, crop_txt = self.multi_scale_random_crop(synth_img, synth_mask, text_core_mask, target_size=768)
 
-        # 稍微膨脹手寫 mask (kernel 3x3)，確保手寫筆劃邊緣的過渡像素不會被算作純印刷文字遭受 3.0x 誤殺罰分！
-        synth_mask_dilated = cv2.dilate(synth_mask, np.ones((3, 3), np.uint8), iterations=1)
-        pure_text_mask = (text_core_mask > 0) & (synth_mask_dilated == 0)
+        # 形態學安全緩衝區排除 (3x3 膨脹避免受罰)
+        hw_dil = cv2.dilate(crop_hw, np.ones((3, 3), np.uint8))
+        pure_text = (crop_txt > 0) & (hw_dil == 0)
 
-        im_rgb = cv2.cvtColor(synth_img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        im_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         norm_img = (im_rgb - self.mean) / self.std
 
         tensor_img = torch.from_numpy(norm_img).permute(2, 0, 1).float()
-        tensor_mask = torch.from_numpy((synth_mask > 128).astype(np.float32)).unsqueeze(0)
-        tensor_pure_text = torch.from_numpy(pure_text_mask.astype(np.float32)).unsqueeze(0)
+        tensor_mask = torch.from_numpy((crop_hw > 128).astype(np.float32)).unsqueeze(0)
+        tensor_pure_text = torch.from_numpy(pure_text.astype(np.float32)).unsqueeze(0)
 
         return tensor_img, tensor_mask, tensor_pure_text
-
-def full_dynamic_collate_fn(batch):
-    patch_size = 768
-    crop_imgs, crop_masks, crop_texts = [], [], []
-
-    for img, mask, text in batch:
-        _, H, W = img.shape
-        if H >= patch_size and W >= patch_size:
-            hw_ys, hw_xs = torch.where(mask[0] > 0.5)
-            
-            # 決定垂直裁切中心
-            if len(hw_ys) > 50 and random.random() < 0.85:
-                c_idx = random.randint(0, len(hw_ys) - 1)
-                cy, cx = hw_ys[c_idx].item(), hw_xs[c_idx].item()
-                y1 = int(np.clip(cy - patch_size // 2, 0, H - patch_size))
-            else:
-                cx = random.randint(0, W)
-                y1 = random.randint(0, H - patch_size)
-
-            # ★ 欄位感知水平對齊 (保證題號與完整題幹納入 768px 視野)
-            if W > 1600:
-                # A3 雙欄考卷：以左欄或右欄起始邊距為基準，確保包含題號
-                if cx < W // 2:
-                    # 左欄題號在 x ~ 100-150，x1 從 30~120 切入
-                    x1 = random.randint(30, min(140, W - patch_size))
-                else:
-                    # 右欄題號在 x ~ 1300-1360，x1 從 1220~1320 切入
-                    x1 = random.randint(min(W - patch_size, 1220), min(W - patch_size, 1320))
-            else:
-                # A4 單欄考卷 (W ~ 1240)：題號在 x ~ 80-140，x1 從 0~120 切入
-                x1 = random.randint(0, min(120, W - patch_size))
-            
-            crop_imgs.append(img[:, y1:y1+patch_size, x1:x1+patch_size])
-            crop_masks.append(mask[:, y1:y1+patch_size, x1:x1+patch_size])
-            crop_texts.append(text[:, y1:y1+patch_size, x1:x1+patch_size])
-        else:
-            pad_h = max(0, patch_size - H)
-            pad_w = max(0, patch_size - W)
-            crop_imgs.append(F.pad(img, (0, pad_w, 0, pad_h), value=1.0))
-            crop_masks.append(F.pad(mask, (0, pad_w, 0, pad_h), value=0.0))
-            crop_texts.append(F.pad(text, (0, pad_w, 0, pad_h), value=0.0))
-
-    return torch.stack(crop_imgs), torch.stack(crop_masks), torch.stack(crop_texts)

@@ -26,3 +26,5 @@ debug_*.png
 debug_*.pdf
 *.log
 .aider*
+
+Thumbs.db

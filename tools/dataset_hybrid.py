@@ -26,15 +26,34 @@ class HybridExamDataset(Dataset):
         assets_root="/content/assets",
         catalog_path="/content/assets/scanned_catalog.json",
         anchors_path="/content/assets/exam_anchors_catalog.json",
+        pseudo_root="output/pseudo_hard_dataset",
         total_steps=1600,
         dpi=150,
         is_train=True,
-        real_ratio=0.20
+        real_ratio=0.20,
+        pseudo_ratio=0.20
     ):
         self.total_steps = total_steps
         self.is_train = is_train
         self.real_ratio = real_ratio
+        self.pseudo_ratio = pseudo_ratio
         self.dpi = dpi
+
+        # ----------------------------------------------------
+        # 軌道 3: 飛輪偽標籤數據 (Pseudo Hard Dataset)
+        # ----------------------------------------------------
+        self.pseudo_items = []
+        p_img_dir = os.path.join(pseudo_root, "images")
+        if os.path.exists(p_img_dir):
+            for ip in sorted(glob.glob(os.path.join(p_img_dir, "*.png"))):
+                stem = os.path.splitext(os.path.basename(ip))[0]
+                self.pseudo_items.append({
+                    "image": ip,
+                    "clean": os.path.join(pseudo_root, "clean_gt", f"{stem}.png"),
+                    "hw_mask": os.path.join(pseudo_root, "hw_masks", f"{stem}.png"),
+                    "text_mask": os.path.join(pseudo_root, "text_masks", f"{stem}.png")
+                })
+        print(f"[HybridDataset] 載入飛輪偽標籤大字難例: {len(self.pseudo_items)} 組")
 
         # ImageNet 歸一化常數
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -454,12 +473,46 @@ class HybridExamDataset(Dataset):
 
         return tensor_img, tensor_mask, tensor_pure_text
 
+    def sample_pseudo_pair(self):
+        item = random.choice(self.pseudo_items)
+        img = cv2.imread(item["image"], cv2.IMREAD_COLOR)
+        hw_m = cv2.imread(item["hw_mask"], cv2.IMREAD_GRAYSCALE)
+        txt_m = cv2.imread(item["text_mask"], cv2.IMREAD_GRAYSCALE)
+
+        if img is None or hw_m is None or txt_m is None:
+            return None
+
+        if self.is_train and random.random() < 0.5:
+            h, w = img.shape[:2]
+            angle = random.uniform(-1.0, 1.0)
+            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
+            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=(255,255,255))
+            hw_m = cv2.warpAffine(hw_m, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+            txt_m = cv2.warpAffine(txt_m, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+
+        im_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        norm_img = (im_rgb - self.mean) / self.std
+
+        tensor_img = torch.from_numpy(norm_img).permute(2, 0, 1).float()
+        tensor_mask = torch.from_numpy((hw_m > 128).astype(np.float32)).unsqueeze(0)
+        tensor_pure_text = torch.from_numpy((txt_m > 128).astype(np.float32)).unsqueeze(0)
+        return tensor_img, tensor_mask, tensor_pure_text
+
     def __getitem__(self, idx):
-        use_real = (len(self.real_items) > 0) and (random.random() < self.real_ratio)
-        if use_real:
+        r = random.random()
+        # 1. 軌道 3: 20% 偽標籤大字難例
+        if len(self.pseudo_items) > 0 and r < self.pseudo_ratio:
+            res = self.sample_pseudo_pair()
+            if res is not None:
+                return res
+
+        # 2. 軌道 1: 20% ExamInk-Seg 真實試卷
+        if len(self.real_items) > 0 and r < (self.pseudo_ratio + self.real_ratio):
             res = self.sample_real_pair()
             if res is not None:
                 return res
+
+        # 3. 軌道 2: 60% 在地全動態包覆合成
         return self.sample_synthetic_pair()
 
 def hybrid_collate_fn(batch):

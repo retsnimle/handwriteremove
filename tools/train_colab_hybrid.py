@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-雙軌混合考卷手寫擦除訓練器 (Colab Hybrid Real & Dynamic Training Runner)
+三軌混合考卷手寫擦除訓練器 (Colab Tri-Track Hybrid & Decoupled Loss Runner)
 架構特點：
-1. 雙軌數據來源：
-   - 50% 採樣自 ExamInk-Seg 真實試卷庫 (1,511 對真實學生塗改、密集算式與淡鉛筆)
-   - 50% 採樣自在地 106 頁掃描動態合成 (臺灣學測版型 + 印章粗細呼吸與微幾何擾動)
-2. 雙重保護損失 (Text-Aware Combined Loss)：
-   - Dice Loss (強化筆劃完整性)
-   - BCE Loss (像素分類穩定性)
-   - 3.0x 印刷文字誤殺懲罰 (Text False Positive Penalty)，確保字母與題號 100% 留存
-3. 熱啟動遷移：從現有最佳權重 best_exam_remover.pth 續練微調，吸收真實試卷筆跡
+1. 三軌混合數據來源：
+   - 60% 臺灣學測在地掃描全動態包覆合成 (突破空間隔離，1.8~3.5x 大字騎乘覆蓋)
+   - 20% ExamInk-Seg 真實試卷庫 (1,511 對真實學生塗改、密集算式與淡鉛筆)
+   - 20% 雙尺度喚醒飛輪偽標籤 (專攻 1.0x 失效之超大字與弧線難例)
+2. 解耦損失函數 (DecoupledExamLoss)：
+   - 5px 形態學安全緩衝區 (消滅重疊處的交界恐懼梯度)
+   - 15px 跨字手寫 4.0x 正向召回激勵 (解決機率坍塌至 0.0001 的根因)
+3. 熱啟動遷移：從現有權重續練微調 8 個 Epochs
 """
 
 import os
@@ -18,59 +18,44 @@ import time
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
 
-from dataset_hybrid import HybridExamDataset, hybrid_collate_fn
-
-class TextAwareCombinedLoss(nn.Module):
-    def __init__(self, text_penalty_weight=3.0):
-        super().__init__()
-        self.text_penalty_weight = text_penalty_weight
-
-    def forward(self, logits, targets, pure_text_masks):
-        bce = F.binary_cross_entropy_with_logits(logits, targets)
-
-        probs = torch.sigmoid(logits)
-        smooth = 1e-5
-        intersection = (probs * targets).sum(dim=(2, 3))
-        union = probs.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
-        dice = 1.0 - (2.0 * intersection + smooth) / (union + smooth)
-        dice_loss = dice.mean()
-
-        # 核心：印刷文字誤殺懲罰項
-        text_fp_loss = (probs * pure_text_masks).sum() / (pure_text_masks.sum() + smooth)
-
-        total_loss = 0.5 * bce + 1.0 * dice_loss + self.text_penalty_weight * text_fp_loss
-        return total_loss, bce.item(), dice_loss.item(), text_fp_loss.item()
+# 加入專案路徑
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from losses.decoupled_exam_loss import DecoupledExamLoss
+from tools.dataset_hybrid import HybridExamDataset, hybrid_collate_fn
 
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"=== 雙軌真實+動態混合考卷去手寫訓練 ===")
+    print(f"=== 三軌真實+包覆合成+偽標籤混合考卷去手寫訓練 ===")
     print(f"運算裝置: {device} ({torch.cuda.get_device_name(0) if device=='cuda' else 'CPU'})")
-    print(f"配置: Batch={args.batch_size}, Epochs={args.epochs}, LR={args.lr}, RealRatio={args.real_ratio}, TextPenalty={args.text_penalty}")
+    print(f"配置: Batch={args.batch_size}, Epochs={args.epochs}, LR={args.lr}, RealRatio={args.real_ratio}, PseudoRatio={args.pseudo_ratio}")
 
-    # 1. 建立雙軌資料集
+    # 1. 建立三軌資料集
     train_ds = HybridExamDataset(
         examink_root=args.examink_root,
         scanned_root=args.scanned_root,
         assets_root=args.assets_root,
         catalog_path=args.catalog_path,
+        pseudo_root=args.pseudo_root,
         total_steps=args.steps_per_epoch * args.batch_size,
         dpi=150,
         is_train=True,
-        real_ratio=args.real_ratio
+        real_ratio=args.real_ratio,
+        pseudo_ratio=args.pseudo_ratio
     )
     val_ds = HybridExamDataset(
         examink_root=args.examink_root,
         scanned_root=args.scanned_root,
         assets_root=args.assets_root,
         catalog_path=args.catalog_path,
+        pseudo_root=args.pseudo_root,
         total_steps=args.val_steps * args.batch_size,
         dpi=150,
         is_train=False,
-        real_ratio=args.real_ratio
+        real_ratio=args.real_ratio,
+        pseudo_ratio=args.pseudo_ratio
     )
 
     train_loader = DataLoader(
@@ -79,7 +64,7 @@ def train(args):
         shuffle=True,
         num_workers=args.workers,
         collate_fn=hybrid_collate_fn,
-        pin_memory=True
+        pin_memory=True if device == "cuda" else False
     )
     val_loader = DataLoader(
         val_ds,
@@ -87,10 +72,10 @@ def train(args):
         shuffle=False,
         num_workers=args.workers,
         collate_fn=hybrid_collate_fn,
-        pin_memory=True
+        pin_memory=True if device == "cuda" else False
     )
 
-    # 2. 建立模型 (ResNet34-UNet)
+    # 2. 構建 ResNet34-UNet
     model = smp.Unet(
         encoder_name="resnet34",
         encoder_weights="imagenet",
@@ -99,16 +84,28 @@ def train(args):
         activation=None
     ).to(device)
 
-    # 熱啟動權重
+    # 熱啟動載入
     if args.resume and os.path.exists(args.resume):
-        print(f"★ 載入現有模型權重進行熱啟動微調: {args.resume}")
-        model.load_state_dict(torch.load(args.resume, map_location=device, weights_only=True))
+        print(f"[Model] 正在熱啟動權重: {args.resume}")
+        state = torch.load(args.resume, map_location=device)
+        model.load_state_dict(state, strict=False)
+        print("[Model] ★ 歷史最優權重載入完畢！開始微調。")
+    else:
+        print("[Model] ⚠️ 未指定或未找到 resume 權重，將從 ImageNet 初始特徵開始訓練。")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
-    criterion = TextAwareCombinedLoss(text_penalty_weight=args.text_penalty)
+    # 使用解耦損失函數
+    criterion = DecoupledExamLoss(
+        bce_weight=0.5,
+        dice_weight=1.0,
+        text_fp_weight=args.text_penalty,
+        overlap_recall_boost=4.0,
+        buffer_kernel=5,
+        proximity_kernel=15
+    )
 
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
     best_val_loss = float("inf")
@@ -174,7 +171,7 @@ def train(args):
             torch.save(model.state_dict(), args.save_path)
             print(f"  ★ 儲存最優混合模型 (Val Loss: {best_val_loss:.4f}) -> {args.save_path}")
 
-    print(f"🎉 雙軌混合訓練全數完成！最佳模型已儲存至: {args.save_path}")
+    print(f"🎉 三軌解耦訓練全數完成！最佳模型已儲存至: {args.save_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -182,8 +179,10 @@ if __name__ == "__main__":
     parser.add_argument("--scanned_root", default="scanned_pairs")
     parser.add_argument("--assets_root", default="assets")
     parser.add_argument("--catalog_path", default="assets/scanned_catalog.json")
-    parser.add_argument("--real_ratio", type=float, default=0.20, help="真實考卷採樣比例")
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--pseudo_root", default="output/pseudo_hard_dataset")
+    parser.add_argument("--real_ratio", type=float, default=0.20, help="真實 ExamInk 採樣比例")
+    parser.add_argument("--pseudo_ratio", type=float, default=0.20, help="飛輪偽標籤採樣比例")
+    parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--text_penalty", type=float, default=3.0, help="印刷文字誤殺懲罰權重")
