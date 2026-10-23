@@ -379,6 +379,78 @@ class ExamHandwritingRemover:
         k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         return cv2.dilate(shield.astype(np.uint8), k_dilate).astype(bool)
 
+    @staticmethod
+    def _extract_color_and_vector_shield(bgr_img: np.ndarray, gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        1. 彩色墨水檢測 (Color Ink Mask):
+           考卷為黑白印刷，紅筆/藍筆等彩色墨跡 100% 為手寫作答或老師批改。
+           強制將其標記為手寫擦除，且嚴禁任何護盾保護彩色墨水。
+        2. 選項圖示與斜向箭頭護盾 (Option Vector & Arrow Shield):
+           保護如第 4 題中 (A)~(E) 選項旁的斜向電場線、細箭頭與符號 (stroke_width <= 2.5px)。
+        """
+        H, W = gray.shape[:2]
+
+        # ---------------------------------------------------------
+        # A. 彩色墨水提取 (紅筆 / 藍筆)
+        # ---------------------------------------------------------
+        b = bgr_img[:, :, 0].astype(int)
+        g = bgr_img[:, :, 1].astype(int)
+        r = bgr_img[:, :, 2].astype(int)
+
+        red_ink = ((r - g > 12) & (r - b > 12) & (r > 60))
+        blue_ink = ((b - r > 12) & (b - g > 8) & (b > 60))
+        color_ink_raw = (red_ink | blue_ink)
+        # 膨脹 2px 吞噬彩色筆跡邊緣的抗鋸齒淡化輪廓
+        k_ink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        color_ink = cv2.dilate(color_ink_raw.astype(np.uint8), k_ink).astype(bool)
+
+        # ---------------------------------------------------------
+        # B. 選項向量線條與箭頭提取
+        # ---------------------------------------------------------
+        # 提取細窄印刷骨架 (直徑 <= 2.8px)
+        _, bw = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+        dist = cv2.distanceTransform(bw, cv2.DIST_L2, 3)
+        thin_lines = (dist > 0) & (dist <= 1.8) & (gray < 180) & (~color_ink)
+
+        # 自動定位選擇題選項帶 (尋找 (A), (B), (C) 等橫向排布標籤)
+        char_bw = ((gray < 165) & (dist < 3.0)).astype(np.uint8)
+        num_c, labels_c, stats_c, _ = cv2.connectedComponentsWithStats(char_bw)
+
+        option_row_mask = np.zeros((H, W), dtype=bool)
+        candidate_labels = []
+        for i in range(1, num_c):
+            x, y, w, h = stats_c[i, 0], stats_c[i, 1], stats_c[i, 2], stats_c[i, 3]
+            # 選項標籤 (如 A, B, C, D, E) 尺寸
+            if 12 <= h <= 32 and 8 <= w <= 45:
+                candidate_labels.append((x, y, w, h))
+
+        # 聚合同一水平行的選項 (至少 2 個選項並排，間距在 80~450px 之間)
+        if len(candidate_labels) >= 2:
+            candidate_labels.sort(key=lambda item: item[1]) # 按 y 排序
+            for i in range(len(candidate_labels)):
+                x1, y1, w1, h1 = candidate_labels[i]
+                row_items = [candidate_labels[i]]
+                for j in range(i + 1, len(candidate_labels)):
+                    x2, y2, w2, h2 = candidate_labels[j]
+                    if abs(y1 - y2) <= 18: # 同一行
+                        row_items.append(candidate_labels[j])
+                if len(row_items) >= 2:
+                    min_y = max(0, min(it[1] for it in row_items) - 15)
+                    max_y = min(H, max(it[1] + it[3] for it in row_items) + 25)
+                    min_x = max(0, min(it[0] for it in row_items) - 10)
+                    max_x = min(W, max(it[0] + it[2] for it in row_items) + 250)
+                    option_row_mask[min_y:max_y, min_x:max_x] = True
+
+        # 在選項行內的所有細印刷線 (電場箭頭、坐標軸、斜線)
+        vector_shield = thin_lines & option_row_mask
+        # 微羽化膨脹 2px，完整覆蓋箭頭尖端
+        k_arrow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        vector_shield = cv2.dilate(vector_shield.astype(np.uint8), k_arrow).astype(bool)
+        vector_shield[color_ink] = False
+
+        return color_ink, vector_shield
+
+
 
     def clean_page(
         self,
@@ -409,19 +481,27 @@ class ExamHandwritingRemover:
         else:
             p_05_refined = np.zeros_like(p_10)
 
-        # 自適應幾何與密度感知印刷文字護盾 + 灰階插圖護盾
+        # 1. 彩色墨水 (紅筆/藍筆) 與 選項向量箭頭護盾
+        color_ink, vector_shield = self._extract_color_and_vector_shield(bgr_img, gray)
+
+        # 2. 自適應幾何與密度感知印刷文字護盾 + 灰階插圖護盾
         p_fused = np.maximum(p_10, p_05_refined)
         printed_shield = self._build_printed_shield(gray, p_10, p_fused=p_fused)
         diagram_shield = self._extract_diagram_shield(gray)
+        # 印刷灰階插圖絕非彩色筆墨，強制剔除彩色像素
+        diagram_shield[color_ink] = False
 
-        # 統一總護盾 (印刷文字 + 灰階插圖)
-        master_protect_shield = printed_shield | diagram_shield
+        # 統一總護盾 (印刷文字 + 灰階插圖 + 選項向量箭頭)
+        master_protect_shield = printed_shield | diagram_shield | vector_shield
+        # 嚴格禁止護盾保護任何彩色筆跡
+        master_protect_shield[color_ink] = False
 
         # 保護式機率融合：任何被判定為印刷文字或插圖的像素，強制機率歸零，物理阻斷 UNet 幻覺
         p_fused[master_protect_shield] = 0.0
 
-        # 手寫二值擦除遮罩提取
-        erase_mask = ((p_fused > prob_threshold) & (~master_protect_shield)).astype(np.uint8) * 255
+        # 手寫二值擦除遮罩提取：高機率筆跡 OR 彩色墨水 (紅筆/藍筆)，且絕不受護盾阻擋
+        raw_erase = ((p_fused > prob_threshold) | color_ink) & (~master_protect_shield) & (gray < 242)
+        erase_mask = raw_erase.astype(np.uint8) * 255
         k_3x3_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         erase_mask = cv2.dilate(erase_mask, k_3x3_rect)
         erase_mask[master_protect_shield] = 0
@@ -469,8 +549,8 @@ class ExamHandwritingRemover:
                 comp = (labels == i)
                 if np.any(comp & struct_hit_zone):
                     lama_mask[comp] = 255
-                elif np.any(comp & diagram_shield):
-                    # 觸及灰階插圖護盾：完全不擦除、不重繪，實現 100% 原圖無損輸出
+                elif np.any(comp & diagram_shield) and not np.any(comp & color_ink):
+                    # 觸及灰階插圖護盾且非彩色墨水：完全不擦除、不重繪，實現 100% 原圖無損輸出
                     continue
                 else:
                     paper_mask[comp] = 255
