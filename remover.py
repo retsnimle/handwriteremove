@@ -133,33 +133,51 @@ class ExamHandwritingRemover:
         out_cropped = out_pad[0, :, :H, :W].permute(1, 2, 0).clamp(0, 1).mul(255).byte().cpu().numpy()
         return out_cropped
 
-    def _build_printed_shield(self, gray: np.ndarray, p_10: np.ndarray) -> np.ndarray:
+    def _build_printed_shield(self, gray: np.ndarray, p_10: np.ndarray, p_fused: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        自適應印刷文字防護盾 (Adaptive Printed Shield):
-        1. 局部對比度歸一化 (Local Contrast Normalization): 15x15 局部最大/最小值濾波，適應淡印與曝光不均
-        2. 筆寬估算 (Stroke Width via Distance Transform): 分離細窄印刷筆劃 (1-3px) 與寬粗手寫筆跡
-        3. 機率門檻限制膨脹 (Probability-Gated Dilation): 僅在純印刷區 (p_10 < 0.10) 膨脹，防護筆跡碰撞區洩漏
+        幾何字符尺度與鄰域密度感知印刷護盾 (Geometric Density-Aware Character Shield):
+        1. 印刷文字 (中文字、英文字母、數字題號、括號) 在 150 DPI 下高度在 12px ~ 36px 之間
+        2. 手寫大字、豎線劃記 (如大 D 豎筆長達 56px，長寬比 > 3.0) 絕非印刷字符，不可保護
+        3. 鄰域密度檢驗：漢字筆劃周圍一定有大量其他筆劃成群緊挨，而作答括號/留白區中的手寫細豎線周圍是孤立白紙
+        4. 相交處機率約束：若神經網絡高置信度判定為手寫 (p_fused > 0.70)，禁止誤吞保護
         """
-        # 1. 局部對比度歸一化
-        k_local = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        local_max = cv2.dilate(gray.astype(np.float32), k_local)
-        local_min = cv2.erode(gray.astype(np.float32), k_local)
-        local_contrast = local_max - local_min + 1e-3
-        normalized_darkness = (local_max - gray) / local_contrast
+        H, W = gray.shape[:2]
+        bw_dark = (gray < 165) & (p_10 < 0.25)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(bw_dark.astype(np.uint8))
+        char_shield = np.zeros((H, W), dtype=bool)
 
-        # 2. 距離變換筆寬估算 (直徑)
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        dist = cv2.distanceTransform(bw, cv2.DIST_L2, 3)
-        stroke_width = 2.0 * dist
+        for i in range(1, num_labels):
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            cx, cy = centroids[i]
 
-        # 印刷骨架判定：對比度顯著、筆劃細窄、原生手寫機率極低
-        is_printed = (normalized_darkness > 0.40) & (stroke_width < 4.0) & (p_10 < 0.20) & (gray < 160)
+            # 1. 幾何尺寸過濾
+            if h > 38 and (h / max(w, 1)) > 3.0:
+                continue  # 細長手寫豎線，剔除！
+            if w > 60 and (w / max(h, 1)) > 5.0:
+                continue  # 細長手寫橫線/劃記，剔除！
 
-        # 3. 機率門檻膨脹 (嚴格限制在非手寫區)
-        k_3x3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        dilated_core = cv2.dilate(is_printed.astype(np.uint8), k_3x3) > 0
-        printed_shield = dilated_core & (gray < 220) & (p_10 < 0.30)
-        return printed_shield
+            # 2. 鄰域密度檢驗
+            roi_y0, roi_y1 = max(0, int(cy - 12)), min(H, int(cy + 12))
+            roi_x0, roi_x1 = max(0, int(cx - 20)), min(W, int(cx + 20))
+            neighbor_dark = np.sum((gray[roi_y0:roi_y1, roi_x0:roi_x1] < 165) & (labels[roi_y0:roi_y1, roi_x0:roi_x1] != i))
+
+            if neighbor_dark < 15 and w < 6:
+                continue
+
+            char_shield[labels == i] = True
+
+        # 稍微膨脹 1px 保護字體抗鋸齒邊緣
+        k_char = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        dilated_char_shield = cv2.dilate(char_shield.astype(np.uint8), k_char) > 0
+
+        # 最終字符護盾：限制在深色且神經網絡沒有以高機率認定為手寫的地方
+        if p_fused is not None:
+            final_shield = dilated_char_shield & (gray < 215) & (p_fused < 0.70)
+        else:
+            final_shield = dilated_char_shield & (gray < 215) & (p_10 < 0.35)
+
+        return final_shield
 
     @staticmethod
     def _merge_proximate_boxes(boxes: np.ndarray, proximity_thresh: int = 48) -> List[List[int]]:
@@ -257,6 +275,20 @@ class ExamHandwritingRemover:
 
         return inpainted, len(clusters)
 
+    @staticmethod
+    def _extract_structural_lines(gray: np.ndarray, min_len: int = 35) -> np.ndarray:
+        """
+        自適應提取頁面上的印刷表格線與幾何直線
+        """
+        bw = (gray < 160).astype(np.uint8) * 255
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_len, 1))
+        h_lines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, h_kernel)
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_len))
+        v_lines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, v_kernel)
+        structural = ((h_lines > 0) | (v_lines > 0)).astype(np.uint8) * 255
+        k_hit = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        return cv2.dilate(structural, k_hit) > 0
+
     def clean_page(
         self,
         bgr_img: np.ndarray,
@@ -286,11 +318,11 @@ class ExamHandwritingRemover:
         else:
             p_05_refined = np.zeros_like(p_10)
 
-        # 自適應印刷文字抗鋸齒護盾
-        printed_shield = self._build_printed_shield(gray, p_10)
+        # 自適應幾何與密度感知印刷文字護盾
+        p_fused = np.maximum(p_10, p_05_refined)
+        printed_shield = self._build_printed_shield(gray, p_10, p_fused=p_fused)
 
         # 保護式機率融合
-        p_fused = np.maximum(p_10, p_05_refined)
         p_fused[printed_shield] = 0.0
 
         # 手寫二值擦除遮罩提取
@@ -310,29 +342,69 @@ class ExamHandwritingRemover:
             }
 
         # ----------------------------------------------------
-        # Stage 2: 結構感知重繪修復 (LaMa 空間聚合或形態學平滑)
+        # Stage 2: 結構感知分流重繪 (Selective Inpainting)
+        # 1. 結構線碰撞筆跡 -> LaMa 空間聚類結構貫通 (Mask 預先膨脹 3px 吞噬殘墨)
+        # 2. 純白紙與作答空隙筆跡 -> 自適應紙色羽化填充 (徹底杜絕黑線毛邊腦補)
         # ----------------------------------------------------
         t_inpaint_start = time.time()
-        if self.use_lama and self.lama_model is not None:
-            rgb_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-            inpainted_rgb, reconstructed_count = self._cluster_and_inpaint(rgb_img, erase_mask)
-            cleaned_bgr = cv2.cvtColor(inpainted_rgb, cv2.COLOR_RGB2BGR)
-        else:
-            # 形態學自然紙色修復 fallback (自適應背景估算)
-            k_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
-            paper_bg = cv2.morphologyEx(bgr_img, cv2.MORPH_CLOSE, k_bg)
-            valid_paper = (gray > 180) & (p_10 < 0.10)
-            if np.any(valid_paper):
-                paper_median = np.median(bgr_img[valid_paper], axis=0)
-                paper_bg = np.maximum(paper_bg, paper_median.astype(np.uint8))
-            else:
-                paper_bg = np.maximum(paper_bg, 240)
 
-            alpha = (erase_mask > 0).astype(np.float32)
-            alpha_blur = cv2.GaussianBlur(alpha, (3, 3), 0)
-            alpha_3c = alpha_blur[..., None]
-            cleaned_bgr = (bgr_img.astype(np.float32) * (1.0 - alpha_3c) + paper_bg.astype(np.float32) * alpha_3c).astype(np.uint8)
-            reconstructed_count = 0
+        # 自適應紙底色估算
+        k_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
+        paper_bg = cv2.morphologyEx(bgr_img, cv2.MORPH_CLOSE, k_bg)
+        valid_paper = (gray > 180) & (p_10 < 0.10)
+        if np.any(valid_paper):
+            paper_median = np.median(bgr_img[valid_paper], axis=0)
+            paper_bg = np.maximum(paper_bg, paper_median.astype(np.uint8))
+        else:
+            paper_bg = np.maximum(paper_bg, 240)
+
+        reconstructed_count = 0
+
+        if self.use_lama and self.lama_model is not None:
+            # 偵測版面上的真正印刷結構線 (表格、框線、坐標軸)
+            struct_hit_zone = self._extract_structural_lines(gray, min_len=35)
+
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((erase_mask > 0).astype(np.uint8))
+            lama_mask = np.zeros_like(erase_mask)
+            paper_mask = np.zeros_like(erase_mask)
+
+            for i in range(1, num_labels):
+                if stats[i, cv2.CC_STAT_AREA] < 8:
+                    continue
+                comp = (labels == i)
+                if np.any(comp & struct_hit_zone):
+                    lama_mask[comp] = 255
+                else:
+                    paper_mask[comp] = 255
+
+            # 1. 純白紙 / 作答區極速羽化填充 (消除毛邊，不產生任何神經網絡幻覺)
+            k_p = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            paper_mask_dilated = cv2.dilate(paper_mask, k_p)
+            paper_mask_dilated[printed_shield] = 0
+
+            alpha = (paper_mask_dilated > 0).astype(np.float32)
+            alpha_blur = cv2.GaussianBlur(alpha, (3, 3), 0)[..., None]
+            stage1_bgr = (bgr_img.astype(np.float32) * (1.0 - alpha_blur) + paper_bg.astype(np.float32) * alpha_blur).astype(np.uint8)
+
+            # 2. 結構相交區調用 LaMa 聚類重繪 (預先膨脹吞噬殘墨)
+            if np.any(lama_mask > 0):
+                k_l = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                lama_mask_dilated = cv2.dilate(lama_mask, k_l)
+                lama_mask_dilated[printed_shield] = 0
+
+                rgb_stage1 = cv2.cvtColor(stage1_bgr, cv2.COLOR_BGR2RGB)
+                inpainted_rgb, reconstructed_count = self._cluster_and_inpaint(rgb_stage1, lama_mask_dilated)
+                cleaned_bgr = cv2.cvtColor(inpainted_rgb, cv2.COLOR_RGB2BGR)
+            else:
+                cleaned_bgr = stage1_bgr
+        else:
+            # 純形態學自然紙色修復 fallback
+            k_p = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            erase_mask_dilated = cv2.dilate(erase_mask, k_p)
+            erase_mask_dilated[printed_shield] = 0
+            alpha = (erase_mask_dilated > 0).astype(np.float32)
+            alpha_blur = cv2.GaussianBlur(alpha, (3, 3), 0)[..., None]
+            cleaned_bgr = (bgr_img.astype(np.float32) * (1.0 - alpha_blur) + paper_bg.astype(np.float32) * alpha_blur).astype(np.uint8)
 
         elapsed = time.time() - t0
         inpaint_elapsed = time.time() - t_inpaint_start
