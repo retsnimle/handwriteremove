@@ -133,51 +133,68 @@ class ExamHandwritingRemover:
         out_cropped = out_pad[0, :, :H, :W].permute(1, 2, 0).clamp(0, 1).mul(255).byte().cpu().numpy()
         return out_cropped
 
-    def _build_printed_shield(self, gray: np.ndarray, p_10: np.ndarray, p_fused: Optional[np.ndarray] = None) -> np.ndarray:
+    def _build_printed_shield(self, gray: np.ndarray, p_10: Optional[np.ndarray] = None, p_fused: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        幾何字符尺度與鄰域密度感知印刷護盾 (Geometric Density-Aware Character Shield):
-        1. 印刷文字 (中文字、英文字母、數字題號、括號) 在 150 DPI 下高度在 12px ~ 36px 之間
-        2. 手寫大字、豎線劃記 (如大 D 豎筆長達 56px，長寬比 > 3.0) 絕非印刷字符，不可保護
-        3. 鄰域密度檢驗：漢字筆劃周圍一定有大量其他筆劃成群緊挨，而作答括號/留白區中的手寫細豎線周圍是孤立白紙
-        4. 相交處機率約束：若神經網絡高置信度判定為手寫 (p_fused > 0.70)，禁止誤吞保護
+        純幾何字元級包圍盒與筆劃寬度感知印刷護盾 (Geometric Character-Level Coherence Shield):
+        ★ 徹底解耦 UNet 預測機率，杜絕細宋體/明體印刷漢字因神經網絡機率飄高而失去保護。
+        1. 印刷文字 (中文字、英文字母、數字題號、括號) 在 150 DPI 下高度在 9px ~ 45px 之間。
+        2. 筆劃厚度：透過距離變換 (Distance Transform)，印刷字體的半寬半徑通常 <= 2.2px (直徑 1~4.4px)，
+           手寫粗跡或粗墨塗鴉 (如粗簽字筆、粗大墨塊) 內部半徑 > 3.8px，予以排除。
+        3. 字元級閉合與包圍盒保護：漢字是由多個細小筆劃構成的方塊字，透過水平方向微閉合將各筆劃
+           聚合成單一字元連通塊，並將該字元方塊內部的深色像素整體保護，杜絕漢字內部細橫被掏空。
+        4. 排除細長大豎線 (如大 D 豎筆長達 55px) 與超長橫線劃記。
         """
         H, W = gray.shape[:2]
-        bw_dark = (gray < 165) & (p_10 < 0.25)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(bw_dark.astype(np.uint8))
+
+        # 1. 提取所有深色筆墨像素 (涵蓋細宋體淡化邊緣)
+        dark = (gray < 195).astype(np.uint8)
+
+        # 2. 距離變換分析筆劃寬度
+        dist = cv2.distanceTransform(dark, cv2.DIST_L2, 5)
+
+        # 3. 形態學水平微閉合聚合漢字筆劃形成字元塊 (Character Blocks)
+        k_char = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 3))
+        closed_char = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, k_char)
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed_char)
         char_shield = np.zeros((H, W), dtype=bool)
 
         for i in range(1, num_labels):
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            cx, cy = centroids[i]
+            x, y, w, h, area = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
 
-            # 1. 幾何尺寸過濾
-            if h > 38 and (h / max(w, 1)) > 3.0:
-                continue  # 細長手寫豎線，剔除！
-            if w > 60 and (w / max(h, 1)) > 5.0:
-                continue  # 細長手寫橫線/劃記，剔除！
-
-            # 2. 鄰域密度檢驗
-            roi_y0, roi_y1 = max(0, int(cy - 12)), min(H, int(cy + 12))
-            roi_x0, roi_x1 = max(0, int(cx - 20)), min(W, int(cx + 20))
-            neighbor_dark = np.sum((gray[roi_y0:roi_y1, roi_x0:roi_x1] < 165) & (labels[roi_y0:roi_y1, roi_x0:roi_x1] != i))
-
-            if neighbor_dark < 15 and w < 6:
+            # 尺寸過濾：印刷字符高度在 9px ~ 45px 之間
+            if not (9 <= h <= 45):
                 continue
 
-            char_shield[labels == i] = True
+            # 幾何過濾：
+            # 1. 排除孤立手寫豎線 (如大 D 的長豎筆、豎向劃記)：寬度極細 (w <= 6) 且高度很長 (h > 28)
+            if w <= 6 and h > 28:
+                continue
+            # 2. 排除孤立手寫橫線或底線：高度極薄 (h <= 5) 且寬度很長 (w > 60)
+            # ★ 注意：漢字橫向排列黏成整行時 (如 w=229, h=24)，高度在 12~35px 之間，絕非底線，必須堅決保護！
+            if h <= 5 and w > 60:
+                continue
 
-        # 稍微膨脹 1px 保護字體抗鋸齒邊緣
-        k_char = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        dilated_char_shield = cv2.dilate(char_shield.astype(np.uint8), k_char) > 0
+            # 筆劃厚度檢查：印刷漢字內部筆劃半寬通常 <= 2.2px
+            roi_dist = dist[y:y+h, x:x+w]
+            roi_mask = (labels[y:y+h, x:x+w] == i)
+            if not np.any(roi_mask):
+                continue
+            max_stroke_r = np.max(roi_dist[roi_mask])
+            if max_stroke_r > 3.8 and h > 25:
+                # 過於粗大的手寫墨跡，剔除
+                continue
 
-        # 最終字符護盾：限制在深色且神經網絡沒有以高機率認定為手寫的地方
-        if p_fused is not None:
-            final_shield = dilated_char_shield & (gray < 215) & (p_fused < 0.70)
-        else:
-            final_shield = dilated_char_shield & (gray < 215) & (p_10 < 0.35)
+            # 將該字元塊緊湊包圍盒內部的深色像素整體保護
+            roi_dark = (gray[y:y+h, x:x+w] < 215) & (closed_char[y:y+h, x:x+w] > 0)
+            char_shield[y:y+h, x:x+w] |= roi_dark
 
-        return final_shield
+        # 稍微膨脹 1px 保護字體抗鋸齒邊緣與細橫尖端
+        k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        shield = cv2.dilate(char_shield.astype(np.uint8), k_dilate).astype(bool)
+        shield &= (gray < 225)
+
+        return shield
 
     @staticmethod
     def _merge_proximate_boxes(boxes: np.ndarray, proximity_thresh: int = 48) -> List[List[int]]:
@@ -398,12 +415,23 @@ class ExamHandwritingRemover:
         g = bgr_img[:, :, 1].astype(int)
         r = bgr_img[:, :, 2].astype(int)
 
-        red_ink = ((r - g > 12) & (r - b > 12) & (r > 60))
-        blue_ink = ((b - r > 12) & (b - g > 8) & (b > 60))
+        # 真正的彩色墨跡檢測：引入 HSV 飽和度約束，杜絕將黑白文字的光學掃描色散邊緣 (S < 30) 誤判為彩色筆墨
+        hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1]
+        
+        red_ink = ((r - g > 15) & (r - b > 15) & (r > 70) & (sat > 35))
+        blue_ink = ((b - r > 15) & (b - g > 10) & (b > 70) & (sat > 35))
         color_ink_raw = (red_ink | blue_ink)
-        # 膨脹 2px 徹底吞噬彩色筆跡邊緣淡化輪廓
-        k_ink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        color_ink = cv2.dilate(color_ink_raw.astype(np.uint8), k_ink).astype(bool)
+        
+        # 僅保留連通面積 >= 12 的真正彩色筆劃，徹底剔除零星孤立的 1px 掃描色像差噪點
+        num_c, labels_c, stats_c, _ = cv2.connectedComponentsWithStats(color_ink_raw.astype(np.uint8))
+        color_ink_filtered = np.zeros((H, W), dtype=bool)
+        for i in range(1, num_c):
+            if stats_c[i, cv2.CC_STAT_AREA] >= 12:
+                color_ink_filtered[labels_c == i] = True
+
+        k_ink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        color_ink = cv2.dilate(color_ink_filtered.astype(np.uint8), k_ink).astype(bool)
 
         # ---------------------------------------------------------
         # B. 選項圖示與斜向箭頭精確提取
@@ -457,7 +485,7 @@ class ExamHandwritingRemover:
         self,
         bgr_img: np.ndarray,
         mode: str = "dual",
-        prob_threshold: float = 0.92,
+        prob_threshold: float = 0.88,
         save_mask: bool = False
     ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
         t0 = time.time()
@@ -503,8 +531,8 @@ class ExamHandwritingRemover:
         # 手寫二值擦除遮罩提取：高機率筆跡 OR 彩色墨水 (紅筆/藍筆)，且絕不受護盾阻擋
         raw_erase = ((p_fused > prob_threshold) | color_ink) & (~master_protect_shield) & (gray < 242)
         erase_mask = raw_erase.astype(np.uint8) * 255
-        k_3x3_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        erase_mask = cv2.dilate(erase_mask, k_3x3_rect)
+        k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        erase_mask = cv2.dilate(erase_mask, k_dilate)
         erase_mask[master_protect_shield] = 0
 
         # 空遮罩保護
@@ -623,6 +651,7 @@ class ExamHandwritingRemover:
         output_pdf: str,
         dpi: int = 150,
         mode: str = "dual",
+        prob_threshold: float = 0.88,
         save_mask: bool = False
     ):
         if fitz is None:
@@ -647,7 +676,7 @@ class ExamHandwritingRemover:
                 nparr = np.frombuffer(img_bytes, np.uint8)
                 img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-                cleaned_bgr, mask, meta = self.clean_page(img_bgr, mode=mode, save_mask=save_mask)
+                cleaned_bgr, mask, meta = self.clean_page(img_bgr, mode=mode, prob_threshold=prob_threshold, save_mask=save_mask)
                 h, w = cleaned_bgr.shape[:2]
 
                 # 串流直接以壓縮圖片寫入 PyMuPDF (保持原 PDF 物理頁面尺寸 points)
