@@ -384,9 +384,10 @@ class ExamHandwritingRemover:
         """
         1. 彩色墨水檢測 (Color Ink Mask):
            考卷為黑白印刷，紅筆/藍筆等彩色墨跡 100% 為手寫作答或老師批改。
-           強制將其標記為手寫擦除，且嚴禁任何護盾保護彩色墨水。
-        2. 選項圖示與斜向箭頭護盾 (Option Vector & Arrow Shield):
-           保護如第 4 題中 (A)~(E) 選項旁的斜向電場線、細箭頭與符號 (stroke_width <= 2.5px)。
+           提取色相差並膨脹 2px 吞噬邊界羽化粉邊，強制標記擦除，絕不容許護盾保護。
+        2. 選項圖示精確護盾 (Option Diagram Shield):
+           僅在檢測到 >=4 個等距並排選項圖形塊 (如第 4 題 (A)~(E) 電場線) 的 ROI 內部保護細箭頭，
+           徹底杜絕護盾擴散至試卷其餘文字與草稿區。
         """
         H, W = gray.shape[:2]
 
@@ -400,54 +401,54 @@ class ExamHandwritingRemover:
         red_ink = ((r - g > 12) & (r - b > 12) & (r > 60))
         blue_ink = ((b - r > 12) & (b - g > 8) & (b > 60))
         color_ink_raw = (red_ink | blue_ink)
-        # 膨脹 2px 吞噬彩色筆跡邊緣的抗鋸齒淡化輪廓
+        # 膨脹 2px 徹底吞噬彩色筆跡邊緣淡化輪廓
         k_ink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         color_ink = cv2.dilate(color_ink_raw.astype(np.uint8), k_ink).astype(bool)
 
         # ---------------------------------------------------------
-        # B. 選項向量線條與箭頭提取
+        # B. 選項圖示與斜向箭頭精確提取
         # ---------------------------------------------------------
-        # 提取細窄印刷骨架 (直徑 <= 2.8px)
-        _, bw = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-        dist = cv2.distanceTransform(bw, cv2.DIST_L2, 3)
-        thin_lines = (dist > 0) & (dist <= 1.8) & (gray < 180) & (~color_ink)
+        vector_shield = np.zeros((H, W), dtype=bool)
 
-        # 自動定位選擇題選項帶 (尋找 (A), (B), (C) 等橫向排布標籤)
-        char_bw = ((gray < 165) & (dist < 3.0)).astype(np.uint8)
-        num_c, labels_c, stats_c, _ = cv2.connectedComponentsWithStats(char_bw)
+        # 二值化並以小核聚合成獨立單元
+        _, bw = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        blocks = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k)
 
-        option_row_mask = np.zeros((H, W), dtype=bool)
-        candidate_labels = []
-        for i in range(1, num_c):
-            x, y, w, h = stats_c[i, 0], stats_c[i, 1], stats_c[i, 2], stats_c[i, 3]
-            # 選項標籤 (如 A, B, C, D, E) 尺寸
-            if 12 <= h <= 32 and 8 <= w <= 45:
-                candidate_labels.append((x, y, w, h))
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(blocks)
 
-        # 聚合同一水平行的選項 (至少 2 個選項並排，間距在 80~450px 之間)
-        if len(candidate_labels) >= 2:
-            candidate_labels.sort(key=lambda item: item[1]) # 按 y 排序
-            for i in range(len(candidate_labels)):
-                x1, y1, w1, h1 = candidate_labels[i]
-                row_items = [candidate_labels[i]]
-                for j in range(i + 1, len(candidate_labels)):
-                    x2, y2, w2, h2 = candidate_labels[j]
-                    if abs(y1 - y2) <= 18: # 同一行
-                        row_items.append(candidate_labels[j])
-                if len(row_items) >= 2:
-                    min_y = max(0, min(it[1] for it in row_items) - 15)
-                    max_y = min(H, max(it[1] + it[3] for it in row_items) + 25)
-                    min_x = max(0, min(it[0] for it in row_items) - 10)
-                    max_x = min(W, max(it[0] + it[2] for it in row_items) + 250)
-                    option_row_mask[min_y:max_y, min_x:max_x] = True
+        comps = []
+        for i in range(1, num):
+            x, y, w, h, area = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
+            if 60 <= w <= 250 and 25 <= h <= 120 and area >= 1000:
+                comps.append((x, y, w, h))
 
-        # 在選項行內的所有細印刷線 (電場箭頭、坐標軸、斜線)
-        vector_shield = thin_lines & option_row_mask
-        # 微羽化膨脹 2px，完整覆蓋箭頭尖端
-        k_arrow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        vector_shield = cv2.dilate(vector_shield.astype(np.uint8), k_arrow).astype(bool)
+        comps.sort(key=lambda c: c[1])
+
+        # 水平聚合：同行且至少 4 個選項單元並排 (如 (A), (B), (C), (D), (E))
+        grouped_rows = []
+        for c in comps:
+            matched = False
+            for r_row in grouped_rows:
+                if abs(np.mean([it[1] for it in r_row]) - c[1]) < 25:
+                    r_row.append(c)
+                    matched = True
+                    break
+            if not matched:
+                grouped_rows.append([c])
+
+        for r_row in grouped_rows:
+            if len(r_row) >= 4:
+                for x, y, w, h in r_row:
+                    roi_gray = gray[y:y+h, x:x+w]
+                    _, bw_roi = cv2.threshold(roi_gray, 180, 255, cv2.THRESH_BINARY_INV)
+                    dist_roi = cv2.distanceTransform(bw_roi, cv2.DIST_L2, 3)
+                    thin_roi = (dist_roi > 0) & (dist_roi <= 2.2) & (roi_gray < 180)
+                    k_arrow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                    thin_dilated = cv2.dilate(thin_roi.astype(np.uint8), k_arrow).astype(bool)
+                    vector_shield[y:y+h, x:x+w] |= thin_dilated
+
         vector_shield[color_ink] = False
-
         return color_ink, vector_shield
 
 
