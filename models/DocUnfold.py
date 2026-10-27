@@ -1,5 +1,8 @@
 import random
-from timm.models.layers import DropPath, to_2tuple
+try:
+    from timm.layers import DropPath, to_2tuple
+except ImportError:
+    from timm.models.layers import DropPath, to_2tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,7 +27,8 @@ def default_conv(in_channels, out_channels, kernel_size,stride=1, bias=True):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, conv, n_feats, kernel_size, bias=True, bn=False, act=nn.PReLU(), res_scale=1):
+    def __init__(self, conv, n_feats, kernel_size, bias=True, bn=False, act=None, res_scale=1):
+        act = nn.PReLU() if act is None else act
 
         super(ResBlock, self).__init__()
         m = []
@@ -104,72 +108,26 @@ class mergeblock(nn.Module):
         out = torch.cat([x, bridge], 1)
         b_, c_, h_, w_ = bridge.shape
         sub = self.subnet(out)
-        V_t = sub.view(b_, self.num_subspace, h_*w_)
-        V_t = V_t / (1e-6 + torch.abs(V_t).sum(axis=2, keepdims=True))
-        V = V_t.permute(0, 2, 1)
-        mat = torch.matmul(V_t, V)
-        mat_float = mat.float()
-        try:
-            mat_inv = torch.inverse(mat_float)
-        except:
-            mat_inv = torch.linalg.pinv(mat_float)
-        mat_inv = mat_inv.to(mat.dtype)
-        project_mat = torch.matmul(mat_inv, V_t)
-        bridge_ = bridge.view(b_, c_, h_*w_)
-        project_feature = torch.matmul(project_mat, bridge_.permute(0, 2, 1))
-        bridge = torch.matmul(V, project_feature).permute(0, 2, 1).view(b_, c_, h_, w_)
-        out = torch.cat([x, bridge], 1)
+        # 局部 FP32 保護：子空間正交投影與求逆矩陣需在單精度下計算，避免半精度下數值溢位超過 65504 產生 NaN/黑方塊
+        with torch.amp.autocast('cuda', enabled=False):
+            sub_f = sub.float()
+            bridge_f = bridge.float()
+            V_t = sub_f.view(b_, self.num_subspace, h_*w_)
+            V_t = V_t / (1e-6 + torch.abs(V_t).sum(axis=2, keepdims=True))
+            V = V_t.permute(0, 2, 1)
+            mat = torch.matmul(V_t, V)
+            try:
+                mat_inv = torch.inverse(mat)
+            except Exception:
+                mat_inv = torch.linalg.pinv(mat)
+            project_mat = torch.matmul(mat_inv, V_t)
+            bridge_ = bridge_f.view(b_, c_, h_*w_)
+            project_feature = torch.matmul(project_mat, bridge_.permute(0, 2, 1))
+            bridge_out = torch.matmul(V, project_feature).permute(0, 2, 1).view(b_, c_, h_, w_).to(dtype=x.dtype)
+
+        out = torch.cat([x, bridge_out], 1)
         out = self.conv_block(out)
-        return out+x
-    
-
-class SKFF(nn.Module):
-    def __init__(self, in_channels, height=3, reduction=8, bias=False):
-        super(SKFF, self).__init__()
-
-        self.height = height
-        d = max(int(in_channels / reduction), 4)
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv_du = nn.Sequential(nn.Conv2d(in_channels, d, 1, padding=0, bias=bias), nn.PReLU())
-
-        self.fcs = nn.ModuleList([])
-        for i in range(self.height):
-            self.fcs.append(nn.Conv2d(d, in_channels, kernel_size=1, stride=1, bias=bias))
-
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, inp_feats):
-        batch_size, n_feats, H, W = inp_feats[1].shape
-
-        inp_feats = torch.cat(inp_feats, dim=1)
-        inp_feats = inp_feats.view(batch_size, self.height, n_feats, inp_feats.shape[2], inp_feats.shape[3])
-
-        feats_U = torch.sum(inp_feats, dim=1)
-        feats_S = self.avg_pool(feats_U)
-        feats_Z = self.conv_du(feats_S)
-
-        attention_vectors = [fc(feats_Z) for fc in self.fcs]
-        attention_vectors = torch.cat(attention_vectors, dim=1)
-        attention_vectors = attention_vectors.view(batch_size, self.height, n_feats, 1, 1)
-
-        attention_vectors = self.softmax(attention_vectors)
-        feats_V = torch.sum(inp_feats * attention_vectors, dim=1)
-
-        return feats_V
-    
-
-class DenseLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DenseLayer, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=3 // 2)
-        self.relu = nn.ReLU(inplace=True)
-        self.sk = SKFF(out_channels, height=2, reduction=8, bias=False)
-
-    def forward(self, x):
-        x1 = self.relu(self.conv(x))
-        output = self.sk((x, x1))
-        return output
+        return out + x
     
 
 class SAM(nn.Module):
@@ -183,26 +141,6 @@ class SAM(nn.Module):
         img = self.conv2(x) + x_img
         x1 = x1 + x
         return x1, img
-    
-
-class SK_RDB(nn.Module):
-    def __init__(self, n_feat, num_layers=3):
-        super(SK_RDB, self).__init__()
-        self.proj = nn.Conv2d(3, n_feat, 1, 1, 0)
-        self.identity = nn.Conv2d(n_feat * 2, n_feat, 1, 1, 0)
-        self.layers = nn.Sequential(
-            *[DenseLayer(n_feat, n_feat) for _ in range(num_layers)]
-        )
-        self.lff = nn.Conv2d(n_feat * 2, 3, kernel_size=1)
-
-    def forward(self, x, x_img):
-        proj = self.proj(x_img)    
-        feat = torch.cat([x, proj], 1)
-        feat = self.identity(feat)
-        feat = self.layers(feat)
-        out = self.lff(torch.cat([proj, feat], 1)) + x_img
-        feat = feat + x
-        return feat, out
     
     
 ##########################################################################
@@ -524,7 +462,7 @@ class ShuffleBlock(nn.Module):
         x = self.norm2(x)
         x = x.view(B, H, W, C)
         
-        shuffle_indices = self._get_shuffle_indices(B, H, W)
+        shuffle_indices = self._get_shuffle_indices(B, H, W, device=x.device)
         x = self._shuffle_and_attend(x, shuffle_indices)
         
         x = shortcut + self.drop_path(x)
@@ -534,9 +472,9 @@ class ShuffleBlock(nn.Module):
         
         return rearrange(x, 'b (h w) c -> b c h w', h=H, w=W)
 
-    def _get_shuffle_indices(self, B, H, W):
+    def _get_shuffle_indices(self, B, H, W, device=None):
         return [
-            (torch.randperm(H), torch.randperm(W))
+            (torch.randperm(H, device=device), torch.randperm(W, device=device))
             for _ in range(B)
         ]
 
@@ -584,7 +522,8 @@ class Decoder(nn.Module):
 ##########################################################################
 ## DGUNet_plus  
 class DocUnfold(nn.Module):
-    def __init__(self, n_feat=40, scale_unetfeats=20, kernel_size=3, reduction=4, bias=False, act=nn.PReLU()):
+    def __init__(self, n_feat=40, scale_unetfeats=20, kernel_size=3, reduction=4, bias=False, act=None):
+        act = nn.PReLU() if act is None else act
         super(DocUnfold, self).__init__()
         # Extract Shallow Features
         self.shallow_feat1 = nn.Sequential(conv(3, n_feat, kernel_size, bias=bias),
@@ -603,22 +542,6 @@ class DocUnfold(nn.Module):
                                            CAB(n_feat, kernel_size, reduction, bias=bias, act=act))
         
         # Gradient Descent Module (GDM)
-        # self.phi_0 = ResBlock(default_conv,3,3)
-        # self.phi_1 = ResBlock(default_conv,3,3)
-        # self.phi_2 = ResBlock(default_conv,3,3)
-        # self.phi_3 = ResBlock(default_conv,3,3)
-        # self.phi_4 = ResBlock(default_conv,3,3)
-        # self.phi_5 = ResBlock(default_conv,3,3)
-        # self.phi_6 = ResBlock(default_conv,3,3)
-
-        # self.phit_0 = ResBlock(default_conv,3,3)
-        # self.phit_1 = ResBlock(default_conv,3,3)
-        # self.phit_2 = ResBlock(default_conv,3,3)
-        # self.phit_3 = ResBlock(default_conv,3,3)
-        # self.phit_4 = ResBlock(default_conv,3,3)
-        # self.phit_5 = ResBlock(default_conv,3,3)
-        # self.phit_6 = ResBlock(default_conv,3,3)
-
         self.phi_0 = ShuffleBlock(dim=3, num_heads=1)
         self.phi_1 = ShuffleBlock(dim=3, num_heads=1)
         self.phi_2 = ShuffleBlock(dim=3, num_heads=1)

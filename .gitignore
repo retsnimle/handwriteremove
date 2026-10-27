@@ -1,4 +1,4 @@
-# Python
+# Python & Virtual Environments
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,23 +8,28 @@ venv/
 dist/
 build/
 
-# Zip bundles & Chunks
-*.zip
+# Staging & Cloud Temporary Caches
+colab_staging/
 chunks_upload/
-clean_pdfs(unuse)/
+*.zip
 
-# Model Weights (Over GitHub 100MB limit)
+# Model Weights (Over GitHub 100MB limit & locally generated)
 weights/*.pth
 weights/*.pt
 weights/*.bin
 weights/.cache/
 
-# Outputs & Debug
+# Outputs, Logs & Debug Artifacts
 output/
 output_cleaned/
+output_images/
 debug_*.png
 debug_*.pdf
+debug_*.jpg
 *.log
 .aider*
+.agents/
 
+# System
 Thumbs.db
+.DS_Store
