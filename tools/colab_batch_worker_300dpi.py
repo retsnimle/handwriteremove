@@ -72,6 +72,8 @@ class CleanConfig:
     gaussian_kernel: int = 5
     gaussian_sigma: float = 1.0
     jpeg_quality: int = 95
+    use_amp: bool = True          # 啟用 FP16 AMP (T4/RTX 具備 Tensor Core 之顯卡); 若無 Tensor Core 建議設為 False
+    fp32: bool = False            # 是否強制 FP32 (無 Tensor Core 顯卡或除錯用)
 
 
 class ColabDualScaleCleaner300DPI:
@@ -176,23 +178,50 @@ class ColabDualScaleCleaner300DPI:
         return self._hanning_cache[key]
 
     def _safe_unfold_batch(self, t_batch):
-        """具備 OOM 自動捕捉與降級退避機制的安全推論 (啟用 PyTorch AMP 混合精度加速)"""
+        """具備 OOM 自動捕捉、NaN 溢位防禦與純 FP32 自動切換機制的安全推論"""
         try:
             with torch.no_grad():
-                enabled = str(self.device).startswith("cuda")
-                with torch.amp.autocast(device_type="cuda" if enabled else "cpu", dtype=torch.float16, enabled=enabled):
+                use_amp = (
+                    str(self.device).startswith("cuda")
+                    and self.cfg.use_amp
+                    and not getattr(self, "_force_fp32", False)
+                )
+                if use_amp:
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                        out_stages = self.unfold_model(t_batch)
+                        res = out_stages[0].float()
+                    if torch.isnan(res).any():
+                        print("  ⚠️ [Precision Guard] 偵測到硬體無 Tensor Core 引發之 FP16 數值溢位 (NaN)，自動無縫切換至純 FP32 精度重算並鎖定！", flush=True)
+                        self._force_fp32 = True
+                        out_stages = self.unfold_model(t_batch)
+                        res = out_stages[0].float()
+                else:
                     out_stages = self.unfold_model(t_batch)
-                    return torch.clamp(out_stages[0].float(), 0.0, 1.0)
+                    res = out_stages[0].float()
+                return torch.clamp(res, 0.0, 1.0)
         except torch.cuda.OutOfMemoryError:
             print("  ⚠️ [VRAM Guard] 觸發顯存突發 OOM，啟動逐張安全降級退避 (batch_size=1)...", flush=True)
             torch.cuda.empty_cache()
             outs = []
-            enabled = str(self.device).startswith("cuda")
+            use_amp = (
+                str(self.device).startswith("cuda")
+                and self.cfg.use_amp
+                and not getattr(self, "_force_fp32", False)
+            )
             for i in range(t_batch.size(0)):
                 with torch.no_grad():
-                    with torch.amp.autocast(device_type="cuda" if enabled else "cpu", dtype=torch.float16, enabled=enabled):
+                    if use_amp:
+                        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                            sub_out = self.unfold_model(t_batch[i : i + 1])
+                            sub_res = sub_out[0].float()
+                        if torch.isnan(sub_res).any():
+                            self._force_fp32 = True
+                            sub_out = self.unfold_model(t_batch[i : i + 1])
+                            sub_res = sub_out[0].float()
+                    else:
                         sub_out = self.unfold_model(t_batch[i : i + 1])
-                        outs.append(torch.clamp(sub_out[0].float(), 0.0, 1.0))
+                        sub_res = sub_out[0].float()
+                    outs.append(torch.clamp(sub_res, 0.0, 1.0))
             return torch.cat(outs, dim=0)
 
     def compute_coarse_priors(self, raw_150_bgr):
@@ -514,6 +543,17 @@ if __name__ == "__main__":
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to run inference on (cuda or cpu)",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=3,
+        help="Batch size for micro DocUnfold patch inference (default: 3 on Colab, use 1 for low VRAM)",
+    )
+    parser.add_argument(
+        "--fp32",
+        action="store_true",
+        help="Force pure FP32 precision (mandatory for GPUs without Tensor Cores like GTX 1650/1660)",
+    )
     args = parser.parse_args()
 
     cfg = CleanConfig(
@@ -521,7 +561,8 @@ if __name__ == "__main__":
         fine_dpi=300,
         patch_size=512,
         stride=384,
-        batch_size=3,
+        batch_size=args.batch_size,
+        use_amp=not args.fp32,
         active_prob_thresh=0.05,
         active_chroma_thresh=10.0,
         dilate_kernel=45,
@@ -542,7 +583,7 @@ if __name__ == "__main__":
     if os.path.isfile(args.input_dir):
         os.makedirs(args.output_dir, exist_ok=True)
         out_pdf = os.path.join(args.output_dir, os.path.basename(args.input_dir))
-        cleaner.clean_pdf(args.input_dir, out_pdf)
+        clean_single_pdf(cleaner, args.input_dir, out_pdf)
     else:
         run_batch_folder(
             cleaner,
