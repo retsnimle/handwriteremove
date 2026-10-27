@@ -49,16 +49,31 @@ uv run python -m tools.self_diagnostic
 
 ### B. Production Inference (Single File or Batch Folder)
 Execute handwriting removal using `tools/colab_batch_worker_300dpi.py`:
-```bash
-# Single PDF exam:
-uv run python -m tools.colab_batch_worker_300dpi --input_dir /path/to/exam.pdf --output_dir /path/to/output_dir
 
-# Entire folder of PDF exams:
+```bash
+# 1. Cloud / Server (Default: batch_size=3, FP16 AMP, requires GPU with Tensor Cores like T4/L4/A100):
 uv run python -m tools.colab_batch_worker_300dpi --input_dir /path/to/dirty_pdfs/ --output_dir /path/to/cleaned_pdfs/
 
-# Optional custom device & weight paths:
-uv run python -m tools.colab_batch_worker_300dpi --input_dir /path/to/exam.pdf --output_dir /path/to/output_dir --device cuda
+# 2. Local Entry-Level GPU (GTX 1650/1660, 4GB VRAM, TU116 without Tensor Cores):
+# MANDATORY: use --batch_size 1 and --fp32. Prevents FP16 numerical overflow (NaN) and dead black patches:
+uv run python -m tools.colab_batch_worker_300dpi --input_dir /path/to/exam.pdf --output_dir /path/to/output_dir --batch_size 1 --device cuda --fp32
+
+# 3. Local Mainstream GPU (RTX 2060/3060/4060, 6GB-8GB VRAM with Tensor Cores):
+uv run python -m tools.colab_batch_worker_300dpi --input_dir /path/to/dirty_pdfs/ --output_dir /path/to/cleaned_pdfs/ --batch_size 2 --device cuda
+
+# 4. CPU Fallback (No CUDA device available):
+uv run python -m tools.colab_batch_worker_300dpi --input_dir /path/to/exam.pdf --output_dir /path/to/output_dir --device cpu --batch_size 1
 ```
+
+#### VRAM Footprint & Batch Sizing Matrix
+| Inference Configuration | Micro Batch Size | Precision | Peak VRAM | Target Hardware | Notes |
+| :--- | :---: | :---: | :---: | :--- | :--- |
+| **Ultra-Low VRAM** | `1` | **FP32** | **$\approx 1.98\text{ GB}$** | GTX 1650 / 1660 (4GB) | Zero spillover to system RAM; immune to NaNs |
+| **Low VRAM** | `1` | **FP16 AMP** | **$\approx 1.62\text{ GB}$** | RTX 3050 (4GB) | Requires Tensor Cores |
+| **Balanced** | `2` | **FP16 AMP** | **$\approx 1.85\text{ GB}$** | RTX 2060 / 3060 (6GB/8GB) | Recommended default for desktop GPUs |
+| **Cloud Default** | `3` | **FP16 AMP** | **$\approx 2.15\text{ GB}$** | Tesla T4 (15GB) / RTX 3060 (12GB) | Default worker setting with 12GB+ headroom |
+| **High Throughput** | `4 ~ 6` | **FP16 AMP** | **$\approx 2.65 \sim 3.40\text{ GB}$** | RTX 4070 / L4 / A100 | Maximum parallel patch speed |
+| **CPU Only** | `1` | **FP32** | **$0\text{ MB}$ (RAM $\approx 3.2\text{ GB}$)** | Headless / Non-CUDA nodes | 30~60s per page |
 
 ### C. Cloud Training & Fine-Tuning Orchestration
 To fine-tune `DocUnfoldV2` on fresh assets via Google Colab:

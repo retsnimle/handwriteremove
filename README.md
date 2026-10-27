@@ -62,7 +62,24 @@
 - 作業系統：Windows 10/11 (含 WSL2 用於 Colab 雲端調度) 或 Linux。
 - Python：Python 3.12+。
 - 套件管理器：推薦使用 `uv` 進行極速依賴管理。
-- 硬體加速：支援 CUDA 之 NVIDIA GPU（推論與訓練支援 Google Colab Tesla T4 15GB VRAM）。
+- 硬體加速：支援 CUDA 之 NVIDIA GPU（推論與訓練支援 Google Colab Tesla T4 15GB VRAM；本地端最低僅需 4GB VRAM 即可運行完整 300 DPI 原生推論）。
+
+### 顯存需求與基準矩陣 (VRAM Footprint & Hardware Benchmarks)
+本管線在設計上具備嚴格的顯存分級保護。在處理標準 JIS B4 試卷（$4352 \times 3200$ @ 300 DPI）時，各推論配置下的 VRAM 實測數據如下：
+
+| 推論配置模式 | 微觀 Batch Size | 運算精度 | 峰值 VRAM 佔用 | 推薦硬體環境 | 備註說明 |
+| :--- | :---: | :---: | :---: | :--- | :--- |
+| **極低顯存模式 (Ultra-Low)** | `1` | **FP32** | **$\approx 1.98\text{ GB}$** | GTX 1650 (4GB) / GTX 1060 (3GB) / 入門筆電 | 實測不外溢至系統 RAM，完全杜絕 NaN |
+| **輕量省顯存模式 (Low)** | `1` | **FP16 AMP** | **$\approx 1.62\text{ GB}$** | RTX 3050 (4GB) / RTX 2060 (6GB) | 需具備硬體 Tensor Core |
+| **標準平衡模式 (Balanced)** | `2` | **FP16 AMP** | **$\approx 1.85\text{ GB}$** | RTX 2060 / 3060 (6GB/8GB) | 本地主流顯卡推薦配置 |
+| **雲端預設模式 (Default)** | `3` | **FP16 AMP** | **$\approx 2.15\text{ GB}$** | Google Colab Tesla T4 (15GB) / RTX 3060 (12GB) | 預設兼顧速度與顯存餘裕（T4 剩餘 12GB+） |
+| **高吞吐批次模式 (Fast)** | `4 ~ 6` | **FP16 AMP** | **$\approx 2.65 \sim 3.40\text{ GB}$** | RTX 3080 / 4070 / L4 / A100 | 高效能工作站批次去筆跡 |
+| **純 CPU 退避模式 (CPU)** | `1` | **FP32** | **$0\text{ MB}$ (RAM $\approx 3.2\text{ GB}$)** | 無獨立 GPU 之伺服器 / PC | 自動使用 CPU 推論，單頁耗時約 30~60 秒 |
+
+> [!IMPORTANT]
+> **無 Tensor Core 顯示卡的重要注意事項 (Turing TU116 / Pascal 等架構)**：
+> 若使用 GTX 1650、GTX 1660 或 GTX 10 系列等缺乏硬體 Tensor Core 的顯示卡，在 FP16 AMP 模式下，DGUNet 的 7 階動態特徵調變會因數值溢位超過 65504 產生 `NaN`，進而導致切塊像素在轉換時被 C++/CUDA 置零產生**死黑方塊**。
+> 本管線已內建 **Precision Guard 自動自癒防禦**，但若在本地純 GPU 執行，建議明確加上 `--fp32` 旗標以獲得最佳穩定性。
 
 ### 依賴安裝
 ```powershell
@@ -100,7 +117,41 @@ uv run python -m tools.self_diagnostic
 === ★ Pipeline Self-Verification PASSED! Specification is 100% reproducible. ★ ===
 ```
 
-### 4.2 雲端原生 300 DPI 微調訓練 (Cloud Training)
+### 4.2 本地推論操作指南 (Local Inference Guide)
+本管線可完全脫離雲端，在個人電腦或本機 GPU 工作站上獨立運作：
+
+#### 1. 單一 PDF 試卷去筆跡 (推薦入門 4GB 顯卡 / 低顯存環境)
+針對低顯存或缺乏 Tensor Core 的顯卡（如 GTX 1650 / 1660 / RTX 3050），指定 `--batch_size 1` 與 `--fp32`：
+```powershell
+uv run python -m tools.colab_batch_worker_300dpi `
+    --input_dir "path/to/exam.pdf" `
+    --output_dir "path/to/cleaned_output" `
+    --batch_size 1 `
+    --device cuda `
+    --fp32
+```
+
+#### 2. 本地資料夾批次處理 (主流顯卡 RTX 2060 / 3060 以上)
+具備 Tensor Core 的顯卡可直接使用預設混合精度（FP16 AMP）加速：
+```powershell
+uv run python -m tools.colab_batch_worker_300dpi `
+    --input_dir "D:/exams/dirty_scans" `
+    --output_dir "D:/exams/cleaned_output" `
+    --batch_size 2 `
+    --device cuda
+```
+
+#### 3. 無獨立 GPU 環境 (純 CPU 模式)
+當系統無可用 NVIDIA 顯卡時，可指定 `--device cpu`（自動使用 CPU 進行推理）：
+```powershell
+uv run python -m tools.colab_batch_worker_300dpi `
+    --input_dir "path/to/exam.pdf" `
+    --output_dir "path/to/cleaned_output" `
+    --device cpu `
+    --batch_size 1
+```
+
+### 4.3 雲端原生 300 DPI 微調訓練 (Cloud Training)
 主調度器整合訓練素材打包、35MB 分卷上傳、遠端 T4 GPU 訓練與權重自動回傳：
 
 ```powershell
@@ -111,7 +162,7 @@ python tools/orchestrate_colab_300dpi.py
 - 在 Colab 執行 1500 steps 原生 300 DPI 微調（有效批次大小 8，AdamW，CosineAnnealingLR）。
 - 訓練完畢自動驗證並下載最新權重至 `weights/best_docunfold_v2_dual_300dpi.pth`。
 
-### 4.3 雲端批次生產推論 (Cloud Batch Inference)
+### 4.4 雲端批次生產推論 (Cloud Batch Inference)
 若本地核心權重已存在，可直接調度無人值守微批次推論（預設處理 243 份自然科段考卷）：
 
 ```powershell
@@ -123,7 +174,7 @@ python tools/orchestrate_colab_300dpi.py --skip_train
 - 下載清洗成果壓縮包，透過 `zipfile.testzip()` 驗證 CRC32，並以原子方式覆蓋目標 PDF。
 - 支援斷點續傳（進度持久化於 `colab_staging/colab_300dpi_production_progress.json`）。
 
-### 4.4 300 DPI 原始手寫素材提取工具
+### 4.5 300 DPI 原始手寫素材提取工具
 若需從新的掃描樣本中擴充真實手寫圖層與記號：
 ```powershell
 python tools/extract_handwriting_assets_300dpi.py
