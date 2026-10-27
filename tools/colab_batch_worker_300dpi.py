@@ -479,6 +479,43 @@ def run_batch_folder(cleaner, input_dir="/content/input_batch", output_dir="/con
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Dual-Scale 300 DPI Handwriting Cleaner (Macro 150 DPI UNet/YOLO + Micro 300 DPI DocUnfoldV2)"
+    )
+    parser.add_argument(
+        "--input_dir",
+        default="/content/input_batch",
+        help="Path to input directory containing PDFs, or path to a single PDF file",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="/content/cleaned_batch",
+        help="Path to output directory for cleaned PDF(s)",
+    )
+    parser.add_argument(
+        "--weights_unfold",
+        default=None,
+        help="Path to DocUnfoldV2 weights (defaults to best_docunfold_v2_dual_300dpi.pth or best_docunfold_v2_5ch.pth)",
+    )
+    parser.add_argument(
+        "--weights_seg",
+        default=None,
+        help="Path to ResNet34-UNet segmentation weights (defaults to best_exam_remover.pth)",
+    )
+    parser.add_argument(
+        "--weights_yolo",
+        default=None,
+        help="Path to DocLayout-YOLO weights (defaults to doclayout_yolo_docstructbench_imgsz1024.pt)",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run inference on (cuda or cpu)",
+    )
+    args = parser.parse_args()
+
     cfg = CleanConfig(
         coarse_dpi=150,
         fine_dpi=300,
@@ -495,11 +532,20 @@ if __name__ == "__main__":
     )
 
     cleaner = ColabDualScaleCleaner300DPI(
+        weights_unfold=args.weights_unfold,
+        weights_seg=args.weights_seg,
+        weights_yolo=args.weights_yolo,
+        device=args.device,
         cfg=cfg,
     )
 
-    run_batch_folder(
-        cleaner,
-        input_dir="/content/input_batch",
-        output_dir="/content/cleaned_batch",
-    )
+    if os.path.isfile(args.input_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
+        out_pdf = os.path.join(args.output_dir, os.path.basename(args.input_dir))
+        cleaner.clean_pdf(args.input_dir, out_pdf)
+    else:
+        run_batch_folder(
+            cleaner,
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+        )
