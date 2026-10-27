@@ -29,7 +29,23 @@ REPO_ROOT = PROJECT_DIR
 STAGING_DIR = os.path.join(PROJECT_DIR, "colab_staging")
 PROGRESS_FILE = os.path.join(STAGING_DIR, "colab_300dpi_production_progress.json")
 SESSION = "exam-v2-prod-300"
-COLAB_BIN = "/home/retsnimle/.local/bin/colab"
+
+
+def _detect_colab_bin():
+    if "COLAB_BIN" in os.environ:
+        return os.environ["COLAB_BIN"]
+    check_cmd = 'which colab 2>/dev/null || (ls /home/*/.local/bin/colab 2>/dev/null | head -n 1)'
+    try:
+        res = subprocess.run(["wsl", "bash", "-c", check_cmd], capture_output=True, text=True, timeout=5)
+        path = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
+        if path:
+            return path
+    except Exception:
+        pass
+    return "/home/retsnimle/.local/bin/colab"
+
+
+COLAB_BIN = _detect_colab_bin()
 MICRO_BATCH_SIZE = 18  # 每批 18 份 (約 40MB)
 EXEC_TIMEOUT = 10800   # 3 小時
 
@@ -94,12 +110,17 @@ def scan_target_files():
         if not os.path.exists(dir_path):
             continue
         for root, dirs, files in os.walk(dir_path):
+            dirs[:] = [
+                d for d in dirs
+                if "已修圖" not in unicodedata.normalize("NFC", d)
+                and "99課綱封存" not in unicodedata.normalize("NFC", d)
+            ]
             norm_root = unicodedata.normalize("NFC", root)
             if "已修圖" in norm_root or "99課綱封存" in norm_root:
                 continue
             for f in files:
                 norm_f = unicodedata.normalize("NFC", f)
-                if norm_f.lower().endswith(".pdf") and not norm_f.endswith("_去手寫.pdf"):
+                if norm_f.lower().endswith(".pdf") and not norm_f.lower().endswith("_去手寫.pdf"):
                     full = os.path.join(root, f)
                     rel = os.path.relpath(full, TARGET_ROOT)
                     raw_files.append({"full": full, "rel": rel, "size": os.path.getsize(full)})
@@ -177,7 +198,7 @@ def init_colab_environment():
     # 檢查遠端是否已存在完整的核心權重 (包含 300 DPI 專用微調權重)
     check_code = """
 import os
-needed = ['best_docunfold_v2_dual_300dpi.pth', 'best_exam_remover.pth', 'doclayout_yolo_docstructbench_imgsz1024.pt']
+needed = ['best_docunfold_v2_dual_300dpi.pth', 'best_docunfold_v2_5ch.pth', 'best_exam_remover.pth', 'doclayout_yolo_docstructbench_imgsz1024.pt']
 all_exist = all(os.path.exists(f'/content/weights/{w}') and os.path.getsize(f'/content/weights/{w}') > 10*1024*1024 for w in needed)
 print('ALL_WEIGHTS_PRESENT' if all_exist else 'WEIGHTS_MISSING')
 """

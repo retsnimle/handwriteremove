@@ -11,14 +11,22 @@ r"""
 """
 
 import os
+import sys
 import json
 import glob
 import argparse
 import cv2
+import numpy as np
 try:
     import pymupdf as fitz
 except ImportError:
     import fitz
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+for p in (SCRIPT_DIR, REPO_ROOT):
+    if p and p not in sys.path:
+        sys.path.insert(0, p)
 
 DPI = 300
 LOW = 0.07          # 遲滯門檻低端

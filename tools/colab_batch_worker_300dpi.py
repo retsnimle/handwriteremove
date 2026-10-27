@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 try:
     import pymupdf as fitz
 except ImportError:
@@ -333,6 +334,11 @@ def clean_single_pdf(cleaner, in_pdf_path, out_pdf_path):
         return False
 
     num_pages = len(doc)
+    if num_pages == 0:
+        print(f"⚠️ PDF 無任何頁面: {in_pdf_path}", flush=True)
+        doc.close()
+        return False
+
     out_doc = fitz.open()
     t0_file = time.time()
 
@@ -341,13 +347,15 @@ def clean_single_pdf(cleaner, in_pdf_path, out_pdf_path):
         mat_150 = fitz.Matrix(cfg.coarse_dpi / 72.0, cfg.coarse_dpi / 72.0)
         # 強制指定 RGB 色彩空間，防禦 CMYK/灰階 色彩反轉與通道猜測
         pix_150 = p.get_pixmap(matrix=mat_150, colorspace=fitz.csRGB, alpha=False)
-        # 使用 samples_mv memoryview 實現真實 100% 零拷貝指標封裝
-        arr_150 = np.frombuffer(pix_150.samples_mv, dtype=np.uint8).reshape((pix_150.height, pix_150.width, 3))
+        # 使用 samples_mv memoryview 實現真實 100% 零拷貝指標封裝 (相容 samples 緩衝區)
+        buf_150 = getattr(pix_150, "samples_mv", pix_150.samples)
+        arr_150 = np.frombuffer(buf_150, dtype=np.uint8).reshape((pix_150.height, pix_150.width, 3))
         img_150 = cv2.cvtColor(arr_150, cv2.COLOR_RGB2BGR)
 
         mat_300 = fitz.Matrix(cfg.fine_dpi / 72.0, cfg.fine_dpi / 72.0)
         pix_300 = p.get_pixmap(matrix=mat_300, colorspace=fitz.csRGB, alpha=False)
-        arr_300 = np.frombuffer(pix_300.samples_mv, dtype=np.uint8).reshape((pix_300.height, pix_300.width, 3))
+        buf_300 = getattr(pix_300, "samples_mv", pix_300.samples)
+        arr_300 = np.frombuffer(buf_300, dtype=np.uint8).reshape((pix_300.height, pix_300.width, 3))
         img_300 = cv2.cvtColor(arr_300, cv2.COLOR_RGB2BGR)
 
         return img_150, img_300, p.rect

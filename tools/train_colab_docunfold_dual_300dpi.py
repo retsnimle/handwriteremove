@@ -230,7 +230,7 @@ class DualScale300DPIDataset(Dataset):
 
         H, W = clean_bgr.shape[:2]
         if H < ps or W < ps:
-            clean_bgr = cv2.resize(clean_bgr, (max(H, ps), max(W, ps)))
+            clean_bgr = cv2.resize(clean_bgr, (max(W, ps), max(H, ps)))
             H, W = clean_bgr.shape[:2]
 
         # --- HARD MINING LOOP: Reject empty/low-ink crops ---
