@@ -107,7 +107,7 @@ uv run python -m tools.self_diagnostic
 # 執行端到端完整管線 (微調訓練 1500 steps + 下載權重 + 啟動生產推論)
 python tools/orchestrate_colab_300dpi.py
 ```
-- 自動將 `assets/hw_layers_300dpi/`（54 份真實手寫圖層）、`assets/hw_marks_300dpi/`（429 份真實手寫記號）與 `scanned_pairs/*.pdf`（11 份高解析度底稿）打包為 `train_bundle_300dpi.zip` 上傳。
+- 自動將 `assets/hw_layers_300dpi/`（54 份真實手寫圖層）、`assets/hw_marks_300dpi/`（429 份真實手寫記號）與 `scanned_pairs/*.pdf`（10 份高解析度底稿）打包為 `train_bundle_300dpi.zip` 上傳。
 - 在 Colab 執行 1500 steps 原生 300 DPI 微調（有效批次大小 8，AdamW，CosineAnnealingLR）。
 - 訓練完畢自動驗證並下載最新權重至 `weights/best_docunfold_v2_dual_300dpi.pth`。
 
@@ -147,7 +147,7 @@ handwriteremove/
 │   ├── DocUnfold.py                      # 解耦之 DGUNet 核心主幹與 FP32 子空間投影模組
 │   ├── DocUnfoldV2.py                    # 5 通道條件式 7 階深度展開網絡 (Zero-Conv 溫啟動)
 │   └── __init__.py
-├── scanned_pairs/                        # 11 份高解析度背景考卷掃描檔 (PDF)
+├── scanned_pairs/                        # 10 份高解析度背景考卷掃描檔 (PDF)
 ├── tools/
 │   ├── colab_batch_worker_300dpi.py      # 雲端雙尺度 300 DPI 批次推論核心節點
 │   ├── extract_handwriting_assets_300dpi.py # 300 DPI 手寫圖層與記號提取工具

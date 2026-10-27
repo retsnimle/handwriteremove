@@ -281,7 +281,7 @@ Generated via `package_training_bundle()` into `colab_staging/train_bundle_300dp
 1. **300 DPI Transparent Handwriting Layers**: `assets/hw_layers_300dpi/*.png` (54 high-res real handwriting layers).
 2. **300 DPI Handwriting Marks & Stamps**: `assets/hw_marks_300dpi/*` (429 individual marks, checks, scores, circles).
 3. **Anchor Catalogs & Metadata**: `assets/exam_anchors_catalog_points.json`, `assets/scanned_catalog.json`.
-4. **Clean Baseline Exam Bitmaps**: `scanned_pairs/*.pdf` (11 high-res exam PDFs cataloging 166 ground-truth clean pages).
+4. **Clean Baseline Exam Bitmaps**: `scanned_pairs/*.pdf` (10 high-res exam PDFs cataloging 166 ground-truth clean pages).
 5. **Transport**: Split into 35MB chunks, uploaded to Colab, and unpacked to `/content/`.
 
 ---
