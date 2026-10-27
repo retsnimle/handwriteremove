@@ -21,8 +21,10 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 import segmentation_models_pytorch as smp
 from doclayout_yolo import YOLOv10
 
@@ -85,7 +87,16 @@ class ColabDualScaleCleaner300DPI:
             classes=1,
             activation=None,
         )
-        self.seg_model.load_state_dict(torch.load(weights_seg, map_location=device, weights_only=True))
+        try:
+            seg_ckpt = torch.load(weights_seg, map_location=device, weights_only=True)
+        except Exception:
+            seg_ckpt = torch.load(weights_seg, map_location=device, weights_only=False)
+        if isinstance(seg_ckpt, dict):
+            if "model_state" in seg_ckpt:
+                seg_ckpt = seg_ckpt["model_state"]
+            elif "state_dict" in seg_ckpt:
+                seg_ckpt = seg_ckpt["state_dict"]
+        self.seg_model.load_state_dict(seg_ckpt)
         self.seg_model.to(device).eval()
 
         # 2. 第一階段：DocLayout-YOLO (宏觀版面分析，置於 GPU 高速推論)
@@ -97,8 +108,16 @@ class ColabDualScaleCleaner300DPI:
 
         # 3. 第二階段：DocUnfoldV2 5 通道端到端物理展開模型 (微觀 300 DPI，置於 GPU)
         self.unfold_model = DocUnfoldV2(cond_c=2).to(device)
-        ckpt = torch.load(weights_unfold, map_location=device, weights_only=True)
-        w1 = ckpt.get("shallow_feat1.0.weight", None)
+        try:
+            ckpt = torch.load(weights_unfold, map_location=device, weights_only=True)
+        except Exception:
+            ckpt = torch.load(weights_unfold, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict):
+            if "model_state" in ckpt:
+                ckpt = ckpt["model_state"]
+            elif "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
+        w1 = ckpt.get("shallow_feat1.0.weight", None) if isinstance(ckpt, dict) else None
         if w1 is not None and w1.shape[1] == 5:
             self.unfold_model.load_state_dict(ckpt)
             print(f"[ColabCleaner] ★ 成功載入 5 通道展開權重: {weights_unfold}", flush=True)

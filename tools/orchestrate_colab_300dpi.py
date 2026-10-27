@@ -24,7 +24,7 @@ import tempfile
 import argparse
 
 TARGET_ROOT = r"F:\【教學】自然科段考卷搜集"
-PROJECT_DIR = r"G:\CODE\handwriteremove"
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_ROOT = PROJECT_DIR
 STAGING_DIR = os.path.join(PROJECT_DIR, "colab_staging")
 PROGRESS_FILE = os.path.join(STAGING_DIR, "colab_300dpi_production_progress.json")
@@ -32,6 +32,15 @@ SESSION = "exam-v2-prod-300"
 COLAB_BIN = "/home/retsnimle/.local/bin/colab"
 MICRO_BATCH_SIZE = 18  # 每批 18 份 (約 40MB)
 EXEC_TIMEOUT = 10800   # 3 小時
+
+
+def to_wsl_path(win_path):
+    """將 Windows 路徑轉換為 WSL /mnt/<drive>/... 路徑格式"""
+    p = os.path.abspath(win_path).replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        drive = p[0].lower()
+        return f"/mnt/{drive}{p[2:]}"
+    return p
 
 
 class CmdResult:
@@ -200,7 +209,7 @@ print('ALL_WEIGHTS_PRESENT' if all_exist else 'WEIGHTS_MISSING')
             idx += 1
 
     for i, cp in enumerate(chunk_paths):
-        wsl_cp = cp.replace("\\", "/").replace("G:", "/mnt/g").replace("g:", "/mnt/g")
+        wsl_cp = to_wsl_path(cp)
         rem_cp = f"/content/mchunk_{i:02d}"
         run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_cp} {rem_cp}")
 
@@ -261,13 +270,13 @@ def run_stage1_training():
             idx += 1
 
     for i, cp in enumerate(chunk_paths):
-        wsl_cp = cp.replace("\\", "/").replace("G:", "/mnt/g").replace("g:", "/mnt/g")
+        wsl_cp = to_wsl_path(cp)
         rem_cp = f"/content/tchunk_{i:02d}"
         run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_cp} {rem_cp}")
 
-    wsl_trainer = "/mnt/g/CODE/handwriteremove/tools/train_colab_docunfold_dual_300dpi.py"
-    wsl_docunfold = "/mnt/g/CODE/handwriteremove/models/DocUnfold.py"
-    wsl_docunfoldv2 = "/mnt/g/CODE/handwriteremove/models/DocUnfoldV2.py"
+    wsl_trainer = to_wsl_path(os.path.join(PROJECT_DIR, "tools", "train_colab_docunfold_dual_300dpi.py"))
+    wsl_docunfold = to_wsl_path(os.path.join(PROJECT_DIR, "models", "DocUnfold.py"))
+    wsl_docunfoldv2 = to_wsl_path(os.path.join(PROJECT_DIR, "models", "DocUnfoldV2.py"))
     run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_trainer} /content/train_colab_docunfold_dual_300dpi.py")
     run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_docunfold} /content/DocUnfold.py")
     run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_docunfoldv2} /content/DocUnfoldV2.py")
@@ -315,7 +324,7 @@ print('[Remote] ★ 300 DPI 專用權重驗證存在且就緒！')
     local_weights_dir = os.path.join(REPO_ROOT, "weights")
     os.makedirs(local_weights_dir, exist_ok=True)
     local_weights_path = os.path.join(local_weights_dir, "best_docunfold_v2_dual_300dpi.pth")
-    wsl_local_weights = local_weights_path.replace("\\", "/").replace("G:", "/mnt/g").replace("g:", "/mnt/g")
+    wsl_local_weights = to_wsl_path(local_weights_path)
 
     print(f"[Colab] 📥 正在將 300 DPI 專用微調權重下載回本機永久保存: {local_weights_path} ...", flush=True)
     run_wsl_cmd(f"{COLAB_BIN} download -s {SESSION} /content/weights/best_docunfold_v2_dual_300dpi.pth {wsl_local_weights}")
@@ -343,18 +352,18 @@ def process_micro_batch(batch_idx, batch_items):
 
     zip_in_name = f"input_micro_{batch_idx:02d}.zip"
     zip_in_path = os.path.join(STAGING_DIR, zip_in_name)
-    wsl_zip_in = f"/mnt/g/CODE/handwriteremove/colab_staging/{zip_in_name}"
+    wsl_zip_in = to_wsl_path(zip_in_path)
 
     zip_out_name = f"cleaned_micro_{batch_idx:02d}.zip"
     zip_out_path = os.path.join(STAGING_DIR, zip_out_name)
-    wsl_zip_out = f"/mnt/g/CODE/handwriteremove/colab_staging/{zip_out_name}"
+    wsl_zip_out = to_wsl_path(zip_out_path)
 
     package_batch_zip(batch_idx, batch_items, zip_in_path)
 
     # 確保遠端 worker 腳本與模型定義為最新版 (支援熱更新)
-    wsl_worker = "/mnt/g/CODE/handwriteremove/tools/colab_batch_worker_300dpi.py"
-    wsl_docunfold = "/mnt/g/CODE/handwriteremove/models/DocUnfold.py"
-    wsl_docunfoldv2 = "/mnt/g/CODE/handwriteremove/models/DocUnfoldV2.py"
+    wsl_worker = to_wsl_path(os.path.join(PROJECT_DIR, "tools", "colab_batch_worker_300dpi.py"))
+    wsl_docunfold = to_wsl_path(os.path.join(PROJECT_DIR, "models", "DocUnfold.py"))
+    wsl_docunfoldv2 = to_wsl_path(os.path.join(PROJECT_DIR, "models", "DocUnfoldV2.py"))
     run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_worker} /content/colab_batch_worker_300dpi.py")
     run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_docunfold} /content/DocUnfold.py")
     run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_docunfoldv2} /content/DocUnfoldV2.py")
@@ -466,7 +475,7 @@ def main():
         run_stage1_training()
 
     # 上傳雙尺度 300 DPI worker 腳本
-    wsl_worker = "/mnt/g/CODE/handwriteremove/tools/colab_batch_worker_300dpi.py"
+    wsl_worker = to_wsl_path(os.path.join(PROJECT_DIR, "tools", "colab_batch_worker_300dpi.py"))
     run_wsl_cmd(f"{COLAB_BIN} upload -s {SESSION} {wsl_worker} /content/colab_batch_worker_300dpi.py")
 
     # 階段二：批次生產

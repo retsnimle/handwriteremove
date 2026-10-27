@@ -15,8 +15,10 @@ import json
 import glob
 import argparse
 import cv2
-import numpy as np
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 
 DPI = 300
 LOW = 0.07          # 遲滯門檻低端
@@ -108,14 +110,25 @@ def extract_marks(rgba, mask, stem, page_idx, out_dir):
 
 
 def main():
-    src_dir = "handwritten_samples"
-    layer_dir = "assets/hw_layers_300dpi"
-    mark_dir = "assets/hw_marks_300dpi"
+    parser = argparse.ArgumentParser(description="300 DPI Handwriting Assets Extractor")
+    parser.add_argument("--src_dir", default="handwritten_samples", help="Directory containing source handwriting sample PDFs")
+    parser.add_argument("--layer_dir", default="assets/hw_layers_300dpi", help="Output directory for fullpage handwriting layers")
+    parser.add_argument("--mark_dir", default="assets/hw_marks_300dpi", help="Output directory for isolated handwriting marks/stamps")
+    args = parser.parse_args()
+
+    src_dir = args.src_dir
+    layer_dir = args.layer_dir
+    mark_dir = args.mark_dir
+
+    pdf_list = sorted(glob.glob(os.path.join(src_dir, "*.pdf")))
+    if not pdf_list:
+        print(f"⚠️ [注意] 樣本目錄 '{src_dir}' 為空或無 PDF 檔案，略過提取以保護現有資產庫完整性。", flush=True)
+        return
+
     for d in (layer_dir, mark_dir):
         os.makedirs(d, exist_ok=True)
 
     all_marks = []
-    pdf_list = sorted(glob.glob(os.path.join(src_dir, "*.pdf")))
     print(f"=== [300 DPI 筆跡素材提取] 正在自 {len(pdf_list)} 份原始樣本中提取 300 DPI 原生筆跡與記號 ===", flush=True)
 
     for pdf in pdf_list:
@@ -138,8 +151,20 @@ def main():
                 print(f"  [300 DPI 筆跡層] {tag}: 筆跡像素 {int(mask.sum())} -> {os.path.basename(out_png)}", flush=True)
         doc.close()
 
-    with open(os.path.join(mark_dir, "marks_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(all_marks, f, ensure_ascii=False, indent=2)
+    if all_marks:
+        meta_path = os.path.join(mark_dir, "marks_meta.json")
+        existing_metas = []
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    existing_metas = json.load(f)
+            except Exception:
+                existing_metas = []
+        combined_metas = {m["file"]: m for m in existing_metas}
+        for m in all_marks:
+            combined_metas[m["file"]] = m
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(list(combined_metas.values()), f, ensure_ascii=False, indent=2)
 
     total_layers = len(glob.glob(layer_dir + "/*.png"))
     print(f"★ 300 DPI 手寫素材提取完成！共取得筆跡層 {total_layers} 頁，記號 {len(all_marks)} 個！", flush=True)

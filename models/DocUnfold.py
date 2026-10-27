@@ -1,4 +1,3 @@
-import random
 try:
     from timm.layers import DropPath, to_2tuple
 except ImportError:
@@ -88,15 +87,6 @@ class CALayer(nn.Module):
         return x * y 
     
 
-# class mergeblock(nn.Module):
-#     def __init__(self, n_feat, kernel_size, bias):
-#         super(mergeblock, self).__init__()
-#         self.conv_block = conv(n_feat * 2, n_feat, kernel_size, bias=bias)
-
-#     def forward(self, x, bridge):
-#         out = torch.cat([x, bridge], 1)
-#         out = self.conv_block(out)
-#         return out + x
 class mergeblock(nn.Module):
     def __init__(self, n_feat, kernel_size, bias, subspace_dim=16):
         super(mergeblock, self).__init__()
@@ -232,53 +222,6 @@ class UNetUpBlock(nn.Module):
         return out
     
 
-class Residual(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x):
-        return self.fn(x) + x
-    
-
-class LayerNormFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias, eps):
-        ctx.eps = eps
-        N, C, H, W = x.size()
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        y = (x - mu) / (var + eps).sqrt()
-        ctx.save_for_backward(y, var, weight)
-        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        eps = ctx.eps
-
-        N, C, H, W = grad_output.size()
-        y, var, weight = ctx.saved_variables
-        g = grad_output * weight.view(1, C, 1, 1)
-        mean_g = g.mean(dim=1, keepdim=True)
-
-        mean_gy = (g * y).mean(dim=1, keepdim=True)
-        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
-        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(
-            dim=0), None
-    
-
-class LayerNorm2d(nn.Module):
-    def __init__(self, channels, eps=1e-6):
-        super(LayerNorm2d, self).__init__()
-        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
-        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
-        self.eps = eps
-
-    def forward(self, x):
-        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
-
-
 def window_partition(x, win_size, dilation_rate=1):
     B, H, W, C = x.shape
     if dilation_rate != 1:
@@ -305,37 +248,6 @@ def window_reverse(windows, win_size, H, W, dilation_rate=1):
     else:
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
-
-
-class ConvProjection(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, kernel_size=3, q_stride=1, k_stride=1, v_stride=1, dropout=0.,
-                 last_stage=False, bias=True):
-        super().__init__()
-
-        inner_dim = dim_head * heads
-        self.heads = heads
-        pad = (kernel_size - q_stride) // 2
-        self.to_q = SepConv2d(dim, inner_dim, kernel_size, q_stride, pad, bias)
-        self.to_k = SepConv2d(dim, inner_dim, kernel_size, k_stride, pad, bias)
-        self.to_v = SepConv2d(dim, inner_dim, kernel_size, v_stride, pad, bias)
-
-    def forward(self, x, attn_kv=None):
-        b, n, c, h = *x.shape, self.heads
-        l = int(math.sqrt(n))
-        w = int(math.sqrt(n))
-
-        attn_kv = x if attn_kv is None else attn_kv
-        x = rearrange(x, 'b (l w) c -> b c l w', l=l, w=w)
-        attn_kv = rearrange(attn_kv, 'b (l w) c -> b c l w', l=l, w=w)
-        # print(attn_kv)
-        q = self.to_q(x)
-        q = rearrange(q, 'b (h d) l w -> b h (l w) d', h=h)
-
-        k = self.to_k(attn_kv)
-        v = self.to_v(attn_kv)
-        k = rearrange(k, 'b (h d) l w -> b h (l w) d', h=h)
-        v = rearrange(v, 'b (h d) l w -> b h (l w) d', h=h)
-        return q, k, v
 
 
 class PModule(nn.Module):
@@ -401,12 +313,10 @@ class WindowAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
 
-        if token_projection == 'conv':
-            self.qkv = ConvProjection(dim, num_heads, dim // num_heads, bias=qkv_bias)
-        elif token_projection == 'linear':
+        if token_projection == 'linear':
             self.qkv = LinearProjection(dim, num_heads, dim // num_heads, bias=qkv_bias)
         else:
-            raise Exception("Projection error!")
+            raise ValueError(f"Unsupported projection: {token_projection}")
 
         self.token_projection = token_projection
         self.attn_drop = nn.Dropout(attn_drop)
@@ -699,8 +609,10 @@ if __name__ == '__main__':
     res = model(x)
     for temp in res:
         print(temp.shape)
-    # calculate parameter and flops using thop
-    from thop import profile
-    macs, params = profile(model, inputs=(x,))
-    print('macs: ', macs, 'params: ', params)
-    print('macs: ', macs / 10 ** 9, 'G, params: ', params / 10 ** 6, 'M')
+    try:
+        from thop import profile
+        macs, params = profile(model, inputs=(x,))
+        print('macs: ', macs, 'params: ', params)
+        print('macs: ', macs / 10 ** 9, 'G, params: ', params / 10 ** 6, 'M')
+    except (ImportError, Exception) as e:
+        print(f"Skipping thop profile: {e}")

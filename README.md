@@ -66,8 +66,11 @@
 
 ### 依賴安裝
 ```powershell
-# 使用 uv 同步虛擬環境與套件
+# 使用 uv 同步虛擬環境與套件 (推薦)
 uv sync
+
+# 或使用標準 pip 安裝
+pip install -r requirements.txt
 ```
 
 ---

@@ -100,7 +100,10 @@ class DualScale300DPIDataset(Dataset):
         return self.total_steps
 
     def _render_page_300(self, item):
-        import fitz
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
         pdf_path = os.path.join(self.scanned_root, item["pdf"])
         doc = fitz.open(pdf_path)
         page = doc[item["page"]]
@@ -336,8 +339,16 @@ def train_dual_scale_300dpi():
 
     model = DocUnfoldV2(cond_c=2).to(device)
     if os.path.exists(args.weights_in):
-        ckpt = torch.load(args.weights_in, map_location=device, weights_only=True)
-        w1 = ckpt.get("shallow_feat1.0.weight", None)
+        try:
+            ckpt = torch.load(args.weights_in, map_location=device, weights_only=True)
+        except Exception:
+            ckpt = torch.load(args.weights_in, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict):
+            if "model_state" in ckpt:
+                ckpt = ckpt["model_state"]
+            elif "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
+        w1 = ckpt.get("shallow_feat1.0.weight", None) if isinstance(ckpt, dict) else None
         if w1 is not None and w1.shape[1] == 5:
             model.load_state_dict(ckpt)
             print(f"★ 成功無損熱啟動 5 通道最佳權重: {args.weights_in}", flush=True)

@@ -433,10 +433,14 @@ Usage: uv run python -m tools.self_diagnostic
 import os
 import sys
 import numpy as np
-import torch
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 
-sys.path.insert(0, os.path.abspath("."))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 def run_diagnostics():

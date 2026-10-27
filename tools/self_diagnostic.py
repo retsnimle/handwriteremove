@@ -12,7 +12,9 @@ try:
 except ImportError:
     import fitz
 
-sys.path.insert(0, os.path.abspath("."))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 def run_diagnostics():
@@ -65,7 +67,8 @@ def run_diagnostics():
     print(f"  [PASS] 4-Edge Pixel SOP Algorithm Logic Valid (Black Ratio: {max_ratio*100:.2f}%)")
 
     # 4. Core Weights Check
-    weights_dir = "weights"
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    weights_dir = os.path.join(repo_root, "weights")
     needed_weights = [
         ("best_exam_remover.pth", 80.0),                               # actual ~93.4 MB
         ("doclayout_yolo_docstructbench_imgsz1024.pt", 30.0),         # actual ~38.8 MB

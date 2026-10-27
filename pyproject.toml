@@ -1,7 +1,7 @@
 [project]
 name = "handwriteremove"
 version = "0.1.0"
-description = "Remove handwritten notes from exams/documents using DIS (IS-Net)"
+description = "Dual-scale coarse-to-fine 300 DPI handwriting removal & restoration for scanned exams"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch==2.13.0",
@@ -14,6 +14,10 @@ dependencies = [
     "tqdm>=4.66.0",
     "huggingface-hub>=0.20.0",
     "rapidocr-onnxruntime>=1.4.4",
+    "timm>=0.9.0",
+    "einops>=0.7.0",
+    "doclayout-yolo>=0.0.2",
+    "segmentation-models-pytorch>=0.3.3",
 ]
 
 [tool.uv]
