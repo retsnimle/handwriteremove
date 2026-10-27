@@ -348,7 +348,7 @@ Execute each verification item to confirm pipeline integrity:
 
 - [ ] **T-1. Training Assets Integrity Check**:
   ```powershell
-  python -c "import glob; assert len(glob.glob('assets/hw_layers_300dpi/*.png')) >= 50; assert len(glob.glob('assets/hw_marks_300dpi/*')) >= 400; assert len(glob.glob('scanned_pairs/*.pdf')) >= 4; print('TRAINING_ASSETS_OK')"
+  python -c "import glob; assert len(glob.glob('assets/hw_layers_300dpi/*.png')) == 54; assert len(glob.glob('assets/hw_marks_300dpi/*')) >= 429; assert len(glob.glob('scanned_pairs/*.pdf')) == 10; print('TRAINING_ASSETS_OK')"
   ```
   Expected output: `TRAINING_ASSETS_OK`.
 

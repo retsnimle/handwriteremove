@@ -24,7 +24,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.models as tv_models
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+for p in (SCRIPT_DIR, REPO_ROOT):
+    if p and p not in sys.path:
+        sys.path.insert(0, p)
+
 try:
     from models.DocUnfoldV2 import DocUnfoldV2
 except ImportError:
@@ -108,8 +113,9 @@ class DualScale300DPIDataset(Dataset):
         doc = fitz.open(pdf_path)
         page = doc[item["page"]]
         mat300 = fitz.Matrix(300 / 72.0, 300 / 72.0)
-        pix300 = page.get_pixmap(matrix=mat300, alpha=False)
-        img300 = cv2.imdecode(np.frombuffer(pix300.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
+        pix300 = page.get_pixmap(matrix=mat300, colorspace=fitz.csRGB, alpha=False)
+        arr300 = np.frombuffer(pix300.samples, dtype=np.uint8).reshape((pix300.height, pix300.width, 3))
+        img300 = cv2.cvtColor(arr300, cv2.COLOR_RGB2BGR)
         doc.close()
         return img300
 
@@ -337,12 +343,18 @@ def train_dual_scale_300dpi():
     dataset = DualScale300DPIDataset(patch_size=512, total_steps=args.steps)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
+    weights_in_path = args.weights_in
+    if not os.path.exists(weights_in_path):
+        local_cand = os.path.join(REPO_ROOT, "weights", os.path.basename(args.weights_in))
+        if os.path.exists(local_cand):
+            weights_in_path = local_cand
+
     model = DocUnfoldV2(cond_c=2).to(device)
-    if os.path.exists(args.weights_in):
+    if os.path.exists(weights_in_path):
         try:
-            ckpt = torch.load(args.weights_in, map_location=device, weights_only=True)
+            ckpt = torch.load(weights_in_path, map_location=device, weights_only=True)
         except Exception:
-            ckpt = torch.load(args.weights_in, map_location=device, weights_only=False)
+            ckpt = torch.load(weights_in_path, map_location=device, weights_only=False)
         if isinstance(ckpt, dict):
             if "model_state" in ckpt:
                 ckpt = ckpt["model_state"]
@@ -351,9 +363,12 @@ def train_dual_scale_300dpi():
         w1 = ckpt.get("shallow_feat1.0.weight", None) if isinstance(ckpt, dict) else None
         if w1 is not None and w1.shape[1] == 5:
             model.load_state_dict(ckpt)
-            print(f"★ 成功無損熱啟動 5 通道最佳權重: {args.weights_in}", flush=True)
+            print(f"★ 成功無損熱啟動 5 通道最佳權重: {weights_in_path}", flush=True)
         else:
             model.load_pretrained_3ch_with_zero_cond(ckpt)
+            print(f"★ 成功以 Zero-Conv 溫啟動 3 通道預訓練權重: {weights_in_path}", flush=True)
+    else:
+        print(f"⚠️ [注意] 指定權重檔不存在: {args.weights_in}，將採隨機初始化權重開始訓練。", flush=True)
 
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)

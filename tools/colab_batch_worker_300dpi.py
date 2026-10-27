@@ -28,10 +28,31 @@ except ImportError:
 import segmentation_models_pytorch as smp
 from doclayout_yolo import YOLOv10
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+for p in (SCRIPT_DIR, REPO_ROOT):
+    if p and p not in sys.path:
+        sys.path.insert(0, p)
+
+
+def _resolve_weight_path(remote_path, default_local_name):
+    """優先檢查遠端 (Colab) 路徑，若不存在則動態降級解析本機 REPO_ROOT/weights"""
+    if os.path.exists(remote_path):
+        return remote_path
+    local_path = os.path.join(REPO_ROOT, "weights", default_local_name)
+    if os.path.exists(local_path):
+        return local_path
+    fallback_local = os.path.join("weights", default_local_name)
+    if os.path.exists(fallback_local):
+        return fallback_local
+    return remote_path
+
+
 try:
     from DocUnfoldV2 import DocUnfoldV2
 except ImportError:
     from models.DocUnfoldV2 import DocUnfoldV2
+
 
 
 @dataclass(frozen=True)
@@ -56,8 +77,8 @@ class ColabDualScaleCleaner300DPI:
     def __init__(
         self,
         weights_unfold=None,
-        weights_seg="/content/weights/best_exam_remover.pth",
-        weights_yolo="/content/weights/doclayout_yolo_docstructbench_imgsz1024.pt",
+        weights_seg=None,
+        weights_yolo=None,
         device="cuda" if torch.cuda.is_available() else "cpu",
         cfg: CleanConfig = CleanConfig(),
     ):
@@ -66,10 +87,15 @@ class ColabDualScaleCleaner300DPI:
         if device == "cuda":
             torch.backends.cudnn.benchmark = True
 
-        # 自動偵測並優先載入新鮮微調的 300 DPI 專用權重
-        dual_300_weights = "/content/weights/best_docunfold_v2_dual_300dpi.pth"
-        base_5ch_weights = "/content/weights/best_docunfold_v2_5ch.pth"
-        if weights_unfold is None or weights_unfold == base_5ch_weights:
+        if weights_seg is None:
+            weights_seg = _resolve_weight_path("/content/weights/best_exam_remover.pth", "best_exam_remover.pth")
+        if weights_yolo is None:
+            weights_yolo = _resolve_weight_path("/content/weights/doclayout_yolo_docstructbench_imgsz1024.pt", "doclayout_yolo_docstructbench_imgsz1024.pt")
+
+        # 自動偵測並優先載入新鮮微調的 300 DPI 專用權重 (優先 /content/weights，動態降級本機 weights)
+        dual_300_weights = _resolve_weight_path("/content/weights/best_docunfold_v2_dual_300dpi.pth", "best_docunfold_v2_dual_300dpi.pth")
+        base_5ch_weights = _resolve_weight_path("/content/weights/best_docunfold_v2_5ch.pth", "best_docunfold_v2_5ch.pth")
+        if weights_unfold is None or weights_unfold in (base_5ch_weights, "/content/weights/best_docunfold_v2_5ch.pth"):
             if os.path.exists(dual_300_weights):
                 weights_unfold = dual_300_weights
                 print(f"[ColabCleaner] ★ 偵測到新鮮出爐的 300 DPI 專用微調權重，自動優先掛載: {dual_300_weights}", flush=True)
@@ -340,8 +366,8 @@ def clean_single_pdf(cleaner, in_pdf_path, out_pdf_path):
 
                 # 像元級四邊驗收 SOP 檢查 (右、底、左、頂四邊 20px 黑色比率 < 5%，含微型尺寸防禦)
                 h_c, w_c = cleaned_bgr.shape[:2]
-                kw = min(20, w_c // 2)
-                kh = min(20, h_c // 2)
+                kw = max(1, min(20, w_c // 2))
+                kh = max(1, min(20, h_c // 2))
                 r_strip = cleaned_bgr[:, -kw:]
                 b_strip = cleaned_bgr[-kh:, :]
                 l_strip = cleaned_bgr[:, :kw]
@@ -429,9 +455,14 @@ def run_batch_folder(cleaner, input_dir="/content/input_batch", output_dir="/con
                 continue
 
             print(f"[{idx:03d}/{total:03d}] 雙尺度處理: {rel_path} ...", flush=True)
-            ok = clean_single_pdf(cleaner, in_path, out_path)
-            if ok:
-                processed_cnt += 1
+            try:
+                ok = clean_single_pdf(cleaner, in_path, out_path)
+                if ok:
+                    processed_cnt += 1
+                else:
+                    print(f"  ❌ 處理失敗: {rel_path}", flush=True)
+            except Exception as e:
+                print(f"  ❌ 處理異常拋出錯誤: {rel_path} ({e})", flush=True)
 
         t_total = time.time() - t_start
         print(f"=== [Dual-Scale Batch Runner] 批次完成！已處理 {processed_cnt} 份，略過 {skipped_cnt} 份，耗時 {t_total/60.0:.1f} 分鐘 ===", flush=True)

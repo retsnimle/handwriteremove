@@ -52,8 +52,8 @@ def run_diagnostics():
     # 3. 4-Edge Pixel SOP Inspection Check
     mock_clean = np.full((3508, 2480, 3), 255, dtype=np.uint8)
     H, W = mock_clean.shape[:2]
-    kw = min(20, W // 2)
-    kh = min(20, H // 2)
+    kw = max(1, min(20, W // 2))
+    kh = max(1, min(20, H // 2))
     r_strip = mock_clean[:, -kw:]
     b_strip = mock_clean[-kh:, :]
     l_strip = mock_clean[:, :kw]
